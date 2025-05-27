@@ -496,8 +496,18 @@ def set_value_in_context(context: Dict[str, Any], key: str, value: Any):
 # ---------------------------
 # Flow Runner Class
 # ---------------------------
+from typing import Callable
+
+
 class FlowRunner:
-    def __init__(self, config: ContainerConfig, flowmap: FlowMap, metrics: Metrics):
+    def __init__(
+        self,
+        config: ContainerConfig,
+        flowmap: FlowMap,
+        metrics: Metrics,
+        *,
+        on_iteration_start: Optional[Callable[[int, Dict[str, Any]], Any]] = None,
+    ):
         self.config = config
         self.flowmap = flowmap # This should be the validated Pydantic model instance
         self.metrics = metrics
@@ -506,7 +516,8 @@ class FlowRunner:
         self._stopped_event: Optional[asyncio.Event] = None # To signal the main loop to stop
         # _active_users_count tracks actively running simulate_user_lifecycle coroutines
         self._active_users_count = 0
-        self.lock = asyncio.Lock() # Lock for managing user_tasks and _active_users_count
+        self.lock = asyncio.Lock()  # Lock for managing user_tasks and _active_users_count
+        self.on_iteration_start = on_iteration_start
 
         self.configure_logging(self.config.debug)
 
@@ -800,6 +811,24 @@ class FlowRunner:
         self._active_users_count = 0 # Direct assignment ok since we are managing stop sequence
         logger.info(f"Flow generation stopped. Reset active user count from {final_count_before_reset} to 0.")
         # Note: self.running flag is already False
+
+    # ------------------------------------------------------------------
+    # Compatibility helpers for continuous-run API
+    # ------------------------------------------------------------------
+    async def run(self):
+        """Alias for start_generating to match older interface."""
+        await self.start_generating()
+
+    async def stop(self):
+        """Alias for stop_generating for API clarity."""
+        await self.stop_generating()
+
+    async def reset(self):
+        """Reset internal state without starting a new run."""
+        await self.stop_generating()
+        async with self.lock:
+            self.user_tasks = []
+            self._active_users_count = 0
 
     def get_active_user_count(self) -> int:
         """Returns the current count of active user simulation tasks."""
@@ -1937,6 +1966,13 @@ class FlowRunner:
             # --- Main Loop ---
             while self.running:
                 flow_iteration += 1
+                if self.on_iteration_start and flow_iteration > 1:
+                    try:
+                        self.on_iteration_start(flow_iteration)
+                    except Exception as cb_err:
+                        logger.error(
+                            f"{user_log_prefix} (Iter {flow_iteration}): onIterationStart callback error: {cb_err}"
+                        )
                 flow_instance_start_time = time.monotonic()
                 flow_epoch_start_time = time.time() # Wall clock time
 
@@ -2047,7 +2083,9 @@ class FlowRunner:
                     # Prevent negative or excessively small rests
                     if rest_duration_s <= 0.001: rest_duration_s = 0.001
 
-                    logger.debug(f"{user_log_prefix}: Resting for {rest_duration_s:.3f} seconds before next iteration.")
+                    logger.info(
+                        f"{user_log_prefix}: Flow iteration {flow_iteration} complete, next in {rest_duration_s:.2f}s"
+                    )
                     try:
                         await asyncio.sleep(rest_duration_s)
                     except asyncio.CancelledError:
