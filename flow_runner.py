@@ -1966,15 +1966,8 @@ class FlowRunner:
             # --- Main Loop ---
             while self.running:
                 flow_iteration += 1
-                if self.on_iteration_start and flow_iteration > 1:
-                    try:
-                        self.on_iteration_start(flow_iteration)
-                    except Exception as cb_err:
-                        logger.error(
-                            f"{user_log_prefix} (Iter {flow_iteration}): onIterationStart callback error: {cb_err}"
-                        )
                 flow_instance_start_time = time.monotonic()
-                flow_epoch_start_time = time.time() # Wall clock time
+                flow_epoch_start_time = time.time()  # Wall clock time
 
                 # --- Generate Per-Flow State ---
                 fake_ip = self.generate_random_ip()
@@ -2017,6 +2010,17 @@ class FlowRunner:
 
                 # Get global flow headers definition (unsubstituted)
                 global_flow_headers_def = getattr(self.flowmap, 'headers', {}) or {}
+
+                if self.on_iteration_start and flow_iteration > 1:
+                    logger.debug(
+                        f"Calling on_iteration_start callback for iteration {flow_iteration} with context keys: {list(context.keys())}"
+                    )
+                    try:
+                        self.on_iteration_start(flow_iteration, context)
+                    except Exception as cb_err:
+                        logger.error(
+                            f"Error during on_iteration_start callback for iteration {flow_iteration}: {cb_err}"
+                        )
 
                 # --- Execute Flow within a Session ---
                 session = None
