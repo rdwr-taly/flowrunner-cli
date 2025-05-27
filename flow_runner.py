@@ -146,6 +146,7 @@ FlowMap.model_rebuild()
 # Configuration Models (Container & Start Request)
 # ---------------------------
 class ContainerConfig(BaseModel):
+    """Runtime configuration for FlowRunner."""
     flow_target_url: str = Field(..., description="Base URL for the target application of the flow")
     flow_target_dns_override: Optional[str] = Field(None, description="IP address to use instead of DNS lookup for the target hostname")
     xff_header_name: str = Field(default="X-Forwarded-For", description="Header name for injecting the fake source IP")
@@ -500,6 +501,7 @@ from typing import Callable
 
 
 class FlowRunner:
+    """Executes flows continuously using asynchronous HTTP requests."""
     def __init__(
         self,
         config: ContainerConfig,
@@ -703,7 +705,7 @@ class FlowRunner:
         )
 
     async def start_generating(self):
-        """Starts the flow generation process and waits until stopped."""
+        """Start all simulated user tasks and run continuously until stopped."""
         async with self.lock: # Protect access to running flag and user_tasks list
             if self.running:
                 logger.warning("Flow generation is already running.")

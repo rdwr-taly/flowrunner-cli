@@ -197,9 +197,10 @@ class StartRequestWrapper(BaseModel):
 
 @app.post('/api/start')
 async def start_flow_runner(data: dict):
-    """
-    Start the flow runner in a background thread using the provided flowmap.
-    If already running, forcibly stop it first, then start with the new parameters.
+    """Start the flow runner with the given configuration and flowmap.
+    The run is continuous and will only stop when `/api/stop` is called or on
+    container shutdown. Supports the `override_step_url_host` config option.
+    If a runner is already active it is stopped before the new one begins.
     """
     global background_thread
 
