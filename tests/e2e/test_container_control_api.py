@@ -42,6 +42,7 @@ import asyncio
 import httpx
 import pytest
 import pytest_asyncio
+import json
 
 import container_control
 from tests.e2e.mock_server import create_mock_server, shutdown_mock_server
@@ -49,8 +50,8 @@ from tests.e2e.mock_server import create_mock_server, shutdown_mock_server
 
 @pytest_asyncio.fixture
 async def mock_server():
-    runner, base_url, hits = await create_mock_server()
-    yield {'base_url': base_url, 'hits': hits}
+    runner, base_url, hits, requests = await create_mock_server()
+    yield {'base_url': base_url, 'hits': hits, 'requests': requests}
     await shutdown_mock_server(runner)
 
 
@@ -163,3 +164,201 @@ async def test_start_with_override_disabled(api_client, mock_server):
     await asyncio.sleep(0.2)
     assert mock_server["hits"].get("/ping", 0) >= 1
     await api_client.post("/api/stop")
+
+
+@pytest.mark.asyncio
+async def test_start_missing_flowmap(api_client):
+    config = {"flow_target_url": "http://example.com", "sim_users": 1}
+    res = await api_client.post("/api/start", json={"config": config})
+    assert res.status_code == 400
+    detail = res.json().get("detail")
+    assert detail and "flowmap" in str(detail)
+
+
+@pytest.mark.asyncio
+async def test_start_invalid_config(api_client):
+    flowmap = {"name": "bad", "steps": []}
+    config = {
+        "flow_target_url": "http://example.com",
+        "sim_users": 0,
+        "override_step_url_host": "yes",
+    }
+    res = await api_client.post("/api/start", json={"config": config, "flowmap": flowmap})
+    assert res.status_code == 400
+    detail = res.json()["detail"]
+    assert any("sim_users" in str(d) or "override_step_url_host" in str(d) for d in detail)
+
+
+@pytest.mark.asyncio
+async def test_start_invalid_step_definition(api_client):
+    flowmap = {"name": "invalid", "steps": [{"id": "no_type"}]}
+    config = {"flow_target_url": "http://example.com", "sim_users": 1}
+    res = await api_client.post("/api/start", json={"config": config, "flowmap": flowmap})
+    assert res.status_code == 400
+    assert "type" in str(res.json().get("detail"))
+
+
+@pytest.mark.asyncio
+async def test_start_while_running_then_stop_noop(api_client, mock_server):
+    flow1 = {
+        "name": "f1",
+        "steps": [{"id": "r1", "type": "request", "method": "GET", "url": "/ping", "onFailure": "continue"}],
+    }
+    flow2 = {
+        "name": "f2",
+        "steps": [{"id": "r2", "type": "request", "method": "GET", "url": "/ping2", "onFailure": "continue"}],
+    }
+    config = {"flow_target_url": mock_server["base_url"], "sim_users": 1, "min_sleep_ms": 10, "max_sleep_ms": 10}
+
+    res1 = await api_client.post("/api/start", json={"config": config, "flowmap": flow1})
+    assert res1.status_code == 200
+    await asyncio.sleep(0.2)
+    res2 = await api_client.post("/api/start", json={"config": config, "flowmap": flow2})
+    assert res2.status_code == 200
+    await asyncio.sleep(0.3)
+    assert mock_server["hits"].get("/ping2", 0) >= 1
+
+    stop_resp = await api_client.post("/api/stop")
+    assert stop_resp.status_code == 200
+    await asyncio.sleep(0.1)
+
+    # Calling stop again when already stopped
+    stop2 = await api_client.post("/api/stop")
+    assert stop2.status_code == 200
+    assert "already stopped" in stop2.json()["message"].lower() or "no running" in stop2.json()["message"].lower()
+
+
+@pytest.mark.asyncio
+async def test_start_with_debug_true(api_client, mock_server):
+    flowmap = {"name": "dbg", "steps": [{"id": "r1", "type": "request", "method": "GET", "url": "/ping", "onFailure": "continue"}]}
+    config = {
+        "flow_target_url": mock_server["base_url"],
+        "sim_users": 1,
+        "min_sleep_ms": 10,
+        "max_sleep_ms": 10,
+        "debug": True,
+    }
+    res = await api_client.post("/api/start", json={"config": config, "flowmap": flowmap})
+    assert res.status_code == 200
+    await asyncio.sleep(0.2)
+    assert mock_server["hits"].get("/ping", 0) >= 1
+    await api_client.post("/api/stop")
+
+
+@pytest.mark.asyncio
+async def test_dns_override_and_host_header(api_client, mock_server, monkeypatch):
+    import aiohttp
+    import socket
+
+    class DummyResolver(aiohttp.abc.AbstractResolver):
+        def __init__(self):
+            self.records = {}
+
+        def add_override(self, host: str, port: int, ip: str) -> None:
+            self.records[(host, port)] = ip
+
+        async def resolve(self, host, port=0, family=socket.AF_INET):
+            ip = self.records.get((host, port), host)
+            return [{"hostname": host, "host": ip, "port": port, "family": family, "proto": 0, "flags": socket.AI_NUMERICHOST}]
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr(aiohttp.resolver, "AsyncResolver", DummyResolver)
+
+    base_url = mock_server["base_url"]
+    port = int(base_url.rsplit(":", 1)[1])
+    flowmap = {"name": "dns", "steps": [{"id": "r1", "type": "request", "method": "GET", "url": "/ping", "onFailure": "continue"}]}
+    config = {
+        "flow_target_url": f"http://example.com:{port}",
+        "sim_users": 1,
+        "min_sleep_ms": 10,
+        "max_sleep_ms": 10,
+        "flow_target_dns_override": "127.0.0.1",
+    }
+    res = await api_client.post("/api/start", json={"config": config, "flowmap": flowmap})
+    assert res.status_code == 200
+    await asyncio.sleep(0.2)
+    req_headers = mock_server["requests"][-1]["headers"]
+    assert req_headers.get("Host") == "example.com"
+    await api_client.post("/api/stop")
+
+
+def _parse_prom_metrics(text: str) -> dict:
+    metrics = {}
+    for line in text.splitlines():
+        if line.startswith("#") or not line.strip():
+            continue
+        key, val = line.split()
+        metrics[key] = float(val)
+    return metrics
+
+
+@pytest.mark.asyncio
+async def test_prometheus_metrics_states(api_client, mock_server):
+    prom_idle = await api_client.get("/metrics")
+    metrics = _parse_prom_metrics(prom_idle.text)
+    assert metrics.get("app_status") == 0.0
+
+    flowmap = {"name": "m", "steps": [{"id": "r1", "type": "request", "method": "GET", "url": "/ping", "onFailure": "continue"}]}
+    config = {"flow_target_url": mock_server["base_url"], "sim_users": 1, "min_sleep_ms": 10, "max_sleep_ms": 10}
+    await api_client.post("/api/start", json={"config": config, "flowmap": flowmap})
+    await asyncio.sleep(0.3)
+    prom_running = await api_client.get("/metrics")
+    metrics_run = _parse_prom_metrics(prom_running.text)
+    assert metrics_run.get("app_status") == 1.0
+    assert metrics_run.get("flow_runner_active_users", 0) >= 1.0
+
+    await api_client.post("/api/stop")
+    await asyncio.sleep(0.2)
+    prom_stopped = await api_client.get("/metrics")
+    metrics_stop = _parse_prom_metrics(prom_stopped.text)
+    assert metrics_stop.get("app_status") == 2.0
+
+
+@pytest.mark.asyncio
+async def test_complex_flow_unquoted_variables(api_client, mock_server):
+    flowmap = {
+        "name": "complex_unquoted",
+        "staticVars": {"nums": [1, 2], "flag": True},
+        "steps": [
+            {
+                "id": "loop",
+                "type": "loop",
+                "source": "{{nums}}",
+                "loopVariable": "num",
+                "steps": [
+                    {
+                        "id": "cond",
+                        "type": "condition",
+                        "conditionData": {"variable": "num", "operator": "greater_than", "value": "0"},
+                        "then": [
+                            {
+                                "id": "req",
+                                "type": "request",
+                                "method": "POST",
+                                "url": "/echo",
+                                "headers": {"Content-Type": "application/json"},
+                                "body": {"number": "##VAR:unquoted:num##", "flag": "##VAR:unquoted:flag##"},
+                                "onFailure": "continue",
+                            }
+                        ],
+                    }
+                ],
+            }
+        ],
+    }
+    config = {"flow_target_url": mock_server["base_url"], "sim_users": 1, "min_sleep_ms": 10, "max_sleep_ms": 10}
+    res = await api_client.post("/api/start", json={"config": config, "flowmap": flowmap})
+    assert res.status_code == 200
+    await asyncio.sleep(0.4)
+    bodies = [
+        json.loads(r["body"] or "null")
+        for r in mock_server["requests"]
+        if r["path"] == "/echo"
+    ]
+    assert {"number": 1, "flag": True} in bodies
+    assert {"number": 2, "flag": True} in bodies
+    await api_client.post("/api/stop")
+
+# Manual signal handling test (SIGTERM) should be performed via Docker: `docker kill -s TERM <container_id>` to verify graceful shutdown.
