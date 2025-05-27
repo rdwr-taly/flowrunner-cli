@@ -18,10 +18,10 @@ async def create_mock_server():
     app.router.add_post('/echo', handle)
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, 'localhost', 0)
+    site = web.TCPSite(runner, '127.0.0.1', 0)
     await site.start()
     port = site._server.sockets[0].getsockname()[1]
-    base_url = f'http://localhost:{port}'
+    base_url = f'http://127.0.0.1:{port}'
     return runner, base_url, app['hits'], app['requests']
 
 async def shutdown_mock_server(runner):

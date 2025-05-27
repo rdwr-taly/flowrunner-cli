@@ -1,7 +1,7 @@
 
 # FlowRunner (Automated API Flow Execution Engine)
 
-**Version:** 1.0.0
+**Version:** 1.1.0
 **Status:** Stable
 
 ## 1. Overview
@@ -15,19 +15,19 @@ FlowRunner is a powerful, UI-less engine designed for the automated execution of
 
 FlowRunner is designed to execute flows exported from a companion graphical flow authoring application, ensuring consistency between flow design and automated execution.
 
-## 2. Key Features (Version 1.0.0)
+## 2. Key Features (Version 1.1.0)
 
 *   **Flow Execution:**
     *   Runs multi-step API flows defined in a JSON format.
     *   Supports **Request Steps** (GET, POST, PUT, PATCH, DELETE, etc.), **Condition Steps** (if/then/else), and **Loop Steps** (for-each).
 *   **Variable Management:**
     *   **Static Variables:** Define global key-value pairs for a flow run.
-    *   **Dynamic Extraction:** Extract data from API responses (status code, headers, JSON body paths) into variables. Logic aligns with advanced authoring tool capabilities.
-    *   **Substitution:** Use `{{variableName}}` syntax in URLs, headers, and request bodies. Special `##VAR:type:name##` markers for precise JSON body value injection (strings vs. native JSON types).
+    *   **Dynamic Extraction:** Extract status codes, headers, and body values (including implicit `body.` paths) into variables.
+    *   **Substitution:** Use `{{variableName}}` syntax in URLs, headers, and request bodies. `##VAR:string:name##` and `##VAR:unquoted:name##` allow precise JSON value injection.
 *   **URL Handling:**
     *   **Global Target URL:** Configure a primary base URL for all flow operations.
     *   **DNS Override:** Optionally override DNS resolution for the global target URL.
-    *   **Flexible Step URLs:** `step.url` can be an absolute URL (potentially using the global DNS override if hosts match) or a relative path that is appended to the `flow_target_url`.
+    *   **Override Step URL Host:** By default the host of every request comes from `flow_target_url`, with the step providing only path/query. Disable with `override_step_url_host: false`.
 *   **Context Management:**
     *   Maintains an execution context that evolves as the flow progresses.
     *   Ensures context isolation for loop iterations.
@@ -35,8 +35,9 @@ FlowRunner is designed to execute flows exported from a companion graphical flow
     *   Randomized source IP injection (via configurable header, e.g., `X-Forwarded-For`).
     *   Rotation of common `User-Agent` strings and other HTTP headers to mimic diverse clients.
 *   **Control API (`container_control.py`):**
-    *   Simple HTTP API for starting, stopping, and monitoring flow execution.
+    *   Simple HTTP API for starting, stopping, and monitoring flow execution (always continuous when started).
     *   Endpoints for health checks and detailed metrics (JSON and Prometheus formats).
+*   **Continuous Operation:** Flows automatically repeat until a stop request is issued.
 *   **Resource Management:**
     *   Configurable memory limits for the container process to prevent run-away resource consumption.
 
@@ -81,6 +82,7 @@ Starts (or restarts) the FlowRunner with the provided configuration and flowmap.
     "min_sleep_ms": "integer (default: 100, min ms between steps)",
     "max_sleep_ms": "integer (default: 1000, max ms between steps)",
     "debug": "boolean (default: false, enables verbose logging)"
+    "override_step_url_host": "boolean (default: true, ignore host in step URLs)"
     // Any other fields defined in ContainerConfig Pydantic model
   },
   "flowmap": {
@@ -304,21 +306,21 @@ Defines iteration over a list.
 
 *   Inside the loop `steps`, `{{loopVariable}}` (e.g., `{{item}}`) and `{{loopVariable_index}}` will be available in the context.
 
-### 5.3. URL Construction Logic (Version 1.0.0 Behavior)
+### 5.3. URL Construction Logic (Version 1.1.0 Behavior)
 
-In this version, FlowRunner uses a "smart" approach to constructing the final URL for a Request step:
+The final URL for each Request step depends on `override_step_url_host`:
 
-1.  **Variable Substitution:** `{{variable}}` placeholders within the `step.url` string are resolved first.
-2.  **Absolute vs. Relative:**
-    *   **If the substituted `step.url` is an absolute URL** (e.g., `https://specific-service.com/api/action` or `{{baseURL}}/api/action` where `baseURL` resolves to `https://host.com`):
-        *   This absolute URL is used directly for the request.
-        *   If `config.flow_target_dns_override` is set AND the hostname in this absolute `step.url` *matches* the hostname of `config.flow_target_url`, then the DNS override is applied. The `Host` header will be set to the original hostname from the `step.url`.
-    *   **If the substituted `step.url` is a relative path** (e.g., `/data` or `users/{{userId}}`):
-        *   It is appended to the `config.flow_target_url` (which acts as the base).
-        *   The path is normalized (e.g., ensuring a leading `/`).
-        *   If `config.flow_target_dns_override` is set, it applies to the base part derived from `config.flow_target_url`. The `Host` header is set to the original hostname from `config.flow_target_url`.
+1.  **Variable Substitution:** `{{variable}}` placeholders within `step.url` are resolved first.
+2.  **When `override_step_url_host` is `true` (default):**
+    *   The scheme/host/port always come from `config.flow_target_url`.
+    *   The path, query, and fragment come from the (substituted) `step.url`.
+    *   Any host information in the step is ignored.
+3.  **When `override_step_url_host` is `false`:**
+    *   If the substituted `step.url` is absolute, it is used as-is (with optional DNS override when the hostname matches `flow_target_url`).
+    *   If it is relative, it is appended to `flow_target_url`.
+4.  **DNS Override:** When `flow_target_dns_override` is set, requests are directed to that IP while the `Host` header reflects the original hostname.
 
-**Note on Future Enhancement (Post-v1.0.0):** A more explicit URL override mechanism (via `config.override_step_url_host`) is planned to give finer control, where `config.flow_target_url` can exclusively define the scheme/host/port, and `step.url` only contributes the path/query. For v1.0.0, the logic described above is active.
+**URL Override Update (v1.1.0):** `config.override_step_url_host` now controls how final request URLs are built. When `true` (default) the scheme/host/port come exclusively from `flow_target_url` and the step only provides the path/query. Set to `false` to allow absolute step URLs as in v1.0.0.
 
 ## 6. Deployment & Usage (Docker)
 
@@ -326,11 +328,11 @@ Refer to the provided `Dockerfile` and `requirements.txt`.
 
 1.  **Build the Docker Image:**
     ```bash
-    docker build -t flowrunner-engine:1.0.0 .
+    docker build -t flowrunner-engine:1.1.0 .
     ```
 2.  **Run the Container:**
     ```bash
-    docker run -d -p 8080:8080 --name my-flowrunner flowrunner-engine:1.0.0
+    docker run -d -p 8080:8080 --name my-flowrunner flowrunner-engine:1.1.0
     ```
     *   The API will be available on `http://localhost:8080`.
     *   Consider volume mounting for persistent configurations or logs if needed.
@@ -342,7 +344,17 @@ Refer to the provided `Dockerfile` and `requirements.txt`.
         curl -X POST -H "Content-Type: application/json" -d @my_flow.json http://localhost:8080/api/start
         ```
 
-## 7. Logging
+## 7. Local Development / Testing
+
+For quick local debugging of `flow_runner.py` without Docker, use the provided `run_local_flow.sh` script:
+
+```bash
+./run_local_flow.sh path/to/flow.json [target_url] [sim_users] [DEBUG|INFO]
+```
+
+This executes the flow directly with a local Python interpreter. Stop with `Ctrl+C` when finished.
+
+## 8. Logging
 
 *   FlowRunner uses Python's standard `logging` module.
 *   Log output goes to `stdout/stderr` within the container.
@@ -350,7 +362,7 @@ Refer to the provided `Dockerfile` and `requirements.txt`.
 *   The `container_control.py` API layer logs at `INFO` level by default.
 *   Timestamps are in UTC, formatted as `YYYY-MM-DD HH:MM:SSZ`.
 
-## 8. Troubleshooting
+## 9. Troubleshooting
 
 *   **Container Won't Start:** Check Docker logs (`docker logs my-flowrunner`) for Python errors, port conflicts, or missing dependencies.
 *   **API Errors (400 Bad Request):** Usually indicates an issue with the JSON payload sent to `/api/start`. Validate your `config` and `flowmap` against the Pydantic models and specifications in this README.
@@ -366,7 +378,7 @@ Refer to the provided `Dockerfile` and `requirements.txt`.
     *   Ensure memory limits in `container_control.py` (or Docker Compose/Kubernetes) are appropriate for your workload.
     *   Profile flows in the authoring tool to identify performance bottlenecks within the flow itself.
 
-## 9. Contributing & Development
+## 10. Contributing & Development
 
 (Placeholder for future contribution guidelines or development setup.)
 
