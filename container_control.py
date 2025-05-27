@@ -19,7 +19,7 @@ from flow_runner import (
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse, Response
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 from typing import Dict, Optional
 
 # ------------------------------------------------------
@@ -215,16 +215,19 @@ async def start_flow_runner(data: dict):
     try:
         start_req_obj = StartRequest(**structured_data)
         logger.info("Start request validated successfully.")
-        # Set logging level for the flow runner based on debug
         log_level = logging.DEBUG if start_req_obj.config.debug else logging.INFO
         fr_logger.setLevel(log_level)
         for handler in fr_logger.handlers:
             handler.setLevel(log_level)
         logger.info(f"Flow Runner log level set to {logging.getLevelName(log_level)}.")
+    except ValidationError as ve:
+        logger.error(f"Request validation failed: {ve}", exc_info=True)
+        current_settings['app_status'] = 'stopped'
+        raise HTTPException(status_code=400, detail=ve.errors())
     except Exception as e:
         logger.error(f"Invalid request body: {e}", exc_info=True)
         current_settings['app_status'] = 'stopped'
-        raise HTTPException(status_code=400, detail=f"Invalid request body: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
 
     # Now we proceed to start fresh
     current_settings['app_status'] = 'running'
@@ -234,6 +237,8 @@ async def start_flow_runner(data: dict):
         daemon=True
     )
     background_thread.start()
+
+    logger.info("FlowRunner started (continuous mode)")
 
     return JSONResponse({"message": "Flow runner started with the provided flowmap"})
 
