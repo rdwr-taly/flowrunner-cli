@@ -33,6 +33,9 @@ setattr(pydantic, "field_validator", field_validator)
 setattr(pydantic, "model_validator", model_validator)
 setattr(pydantic, "ConfigDict", ConfigDict)
 sys.modules.setdefault("pydantic", pydantic)
+import importlib
+del sys.modules["pydantic"]
+sys.modules["pydantic"] = importlib.import_module("pydantic")
 import asyncio
 from typing import Any, Dict
 from unittest.mock import AsyncMock, MagicMock
@@ -47,7 +50,7 @@ from flow_runner import (
     LoopStep,
     ConditionData,
     Metrics,
-    get_value_from_context, _MISSING,
+    get_value_from_context, _MISSING, set_value_in_context,
 )
 
 
@@ -254,3 +257,87 @@ async def test_run_stop_continuous(monkeypatch, base_config, empty_flow):
     if len(contexts) >= 2:
         assert contexts[0]["flowInstance"] == 1
         assert contexts[1]["flowInstance"] == 2
+
+
+
+
+def test_container_config_alias_override_step_url_host():
+    cfg = ContainerConfig(
+        flow_target_url="http://example.com",
+        sim_users=1,
+        **{"Override Step URL Host": False},
+    )
+    assert cfg.override_step_url_host is False
+
+
+def test_container_config_validation_errors():
+    pydantic = sys.modules["pydantic"]
+    with pytest.raises(pydantic.ValidationError):
+        ContainerConfig(
+            flow_target_url="http://example.com",
+            sim_users=0,
+        )
+
+    with pytest.raises(pydantic.ValidationError):
+        ContainerConfig(
+            flow_target_url="http://example.com",
+            sim_users=1,
+            min_sleep_ms=10,
+            max_sleep_ms=5,
+        )
+
+
+def test_get_value_from_context_edge_cases():
+    ctx = {
+        "a": {"b": [1, {"c": 2}]},
+        "zero": 0,
+        "none": None,
+        "false": False,
+    }
+
+    assert get_value_from_context(ctx, "") is _MISSING
+    assert get_value_from_context(ctx, "a.b[1].missing") is _MISSING
+    assert get_value_from_context(ctx, "a.b[2]") is _MISSING
+    assert get_value_from_context(ctx, "a.b.key") is _MISSING
+    assert get_value_from_context(ctx, "a[0]") is _MISSING
+    assert get_value_from_context(ctx, "a.b[0].c") is _MISSING
+    assert get_value_from_context(ctx, "zero") == 0
+    assert get_value_from_context(ctx, "none") is None
+    assert get_value_from_context(ctx, "false") is False
+    assert get_value_from_context(None, "a") is _MISSING
+
+
+def test_set_value_in_context_nested_creation():
+    ctx: Dict[str, Any] = {}
+    set_value_in_context(ctx, "x.y.z", 5)
+    assert ctx == {"x": {"y": {"z": 5}}}
+
+
+def test_set_value_in_context_invalid_indices():
+    ctx = {"arr": [0]}
+    set_value_in_context(ctx, "arr[2]", 9)
+    assert ctx["arr"] == [0]
+    set_value_in_context(ctx, "arr[0].a", 1)  # type mismatch should not raise
+    assert ctx["arr"] == [0]
+
+
+def test_set_value_in_context_invalid_context():
+    set_value_in_context(None, "a", 1)  # Should not raise
+
+
+def test_substitute_variables_unquoted_and_malformed(base_config, empty_flow):
+    runner = make_runner(base_config, empty_flow)
+    context = {"none": None, "lst": [], "d": {}}
+
+    assert runner._substitute_variables("##VAR:unquoted:none##", context) is None
+    assert runner._substitute_variables("##VAR:unquoted:lst##", context) == []
+    assert runner._substitute_variables("##VAR:unquoted:d##", context) == {}
+
+    assert (
+        runner._substitute_variables("##VAR:name##", context)
+        == "##VAR:name##"
+    )
+    assert (
+        runner._substitute_variables("##VAR:unquoted:name:extra##", context)
+        is None
+    )
