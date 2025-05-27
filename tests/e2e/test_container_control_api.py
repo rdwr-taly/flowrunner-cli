@@ -29,6 +29,9 @@ setattr(pydantic, "field_validator", field_validator)
 setattr(pydantic, "model_validator", model_validator)
 setattr(pydantic, "ConfigDict", ConfigDict)
 sys.modules.setdefault("pydantic", pydantic)
+import importlib
+del sys.modules["pydantic"]
+sys.modules["pydantic"] = importlib.import_module("pydantic")
 sys.modules.setdefault("psutil", types.SimpleNamespace(
     cpu_percent=lambda interval=None: 0.0,
     virtual_memory=lambda: types.SimpleNamespace(percent=0.0, available=0, used=0),
