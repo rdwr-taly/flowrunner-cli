@@ -43,6 +43,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 import logging
 import aiohttp
+import copy
 
 from flow_runner import (
     FlowRunner,
@@ -50,6 +51,7 @@ from flow_runner import (
     FlowMap,
     RequestStep,
     LoopStep,
+    ConditionStep,
     ConditionData,
     Metrics,
     get_value_from_context, _MISSING, set_value_in_context,
@@ -440,6 +442,141 @@ async def test_run_stop_continuous(monkeypatch, base_config, empty_flow):
     if len(contexts) >= 2:
         assert contexts[0]["flowInstance"] == 1
         assert contexts[1]["flowInstance"] == 2
+
+
+@pytest.mark.asyncio
+async def test_condition_branch_passes_copied_context(monkeypatch, base_config):
+    cond_step = ConditionStep(
+        id="c1",
+        type="condition",
+        conditionData=ConditionData(variable="v", operator="equals", value="1"),
+        then=[{"id": "t1", "type": "request", "method": "GET", "url": "/", "onFailure": "continue"}],
+        else_=[],
+    )
+    flow = FlowMap(name="f", steps=[cond_step], staticVars={})
+    runner = make_runner(base_config, flow)
+
+    monkeypatch.setattr(runner, "_evaluate_condition", lambda *args, **kw: True)
+    branch_contexts = []
+    orig_execute = runner._execute_steps
+
+    async def patched(steps, session, base_h, flow_h, ctx, depth=0):
+        if depth > 0:
+            branch_contexts.append(ctx)
+            return
+        return await orig_execute(steps, session, base_h, flow_h, ctx, depth)
+
+    monkeypatch.setattr(runner, "_execute_steps", patched)
+
+    runner.running = True
+    session = AsyncMock()
+    ctx = {"v": "1"}
+    await runner._execute_steps([cond_step], session, {}, {}, ctx)
+    assert branch_contexts
+    assert branch_contexts[0]["v"] == "1"
+
+
+@pytest.mark.asyncio
+async def test_condition_evaluation_error_sets_error(monkeypatch, base_config):
+    cond_step = ConditionStep(
+        id="c1",
+        type="condition",
+        conditionData=ConditionData(variable="v", operator="equals", value="1"),
+        then=[{"id": "t1", "type": "request", "method": "GET", "url": "/", "onFailure": "continue"}],
+        else_=[{"id": "e1", "type": "request", "method": "GET", "url": "/", "onFailure": "continue"}],
+    )
+    flow = FlowMap(name="f", steps=[cond_step], staticVars={})
+    runner = make_runner(base_config, flow)
+
+    monkeypatch.setattr(runner, "_evaluate_condition", MagicMock(side_effect=Exception("boom")))
+    branch_called = False
+    orig_exec = runner._execute_steps
+
+    async def patched_exec(steps, session, b, f, ctx, depth=0):
+        nonlocal branch_called
+        if depth > 0:
+            branch_called = True
+            return
+        return await orig_exec(steps, session, b, f, ctx, depth)
+
+    monkeypatch.setattr(runner, "_execute_steps", patched_exec)
+    runner.running = True
+    session = AsyncMock()
+    ctx = {"v": "1"}
+    await runner._execute_steps([cond_step], session, {}, {}, ctx)
+    assert branch_called is False
+    assert ctx.get("flow_error")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("val", ["str", 1, {"a": 1}, None])
+async def test_execute_loop_step_invalid_sources(monkeypatch, base_config, val, caplog):
+    flow = FlowMap(name="f", steps=[], staticVars={})
+    runner = make_runner(base_config, flow)
+    step = LoopStep(id="l1", type="loop", source="{{items}}", loopVariable="i", steps=[{}])
+    session = AsyncMock()
+    monkeypatch.setattr(runner, "_execute_steps", AsyncMock())
+    ctx = {"items": val}
+    runner.running = True
+    with caplog.at_level(logging.WARNING):
+        await runner._execute_loop_step(step, session, {}, {}, ctx, 0, "u")
+    runner._execute_steps.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_on_iteration_start_called_with_context(monkeypatch, base_config):
+    callback_calls = []
+    def on_iter(n, ctx):
+        callback_calls.append((n, ctx.copy()))
+
+    flow = FlowMap(name="f", steps=[], staticVars={"x": 1})
+    runner = make_runner(base_config, flow)
+    runner.on_iteration_start = on_iter
+
+    monkeypatch.setattr(runner, "create_aiohttp_connector", lambda: MagicMock(closed=False, close=AsyncMock()))
+    monkeypatch.setattr(runner, "create_session", lambda conn: MagicMock(closed=False, close=AsyncMock()))
+
+    async def fake_steps(steps, session, base_headers=None, flow_headers=None, context=None, depth=0):
+        if context["flowInstance"] >= 2:
+            runner.running = False
+
+    monkeypatch.setattr(runner, "_execute_steps", fake_steps)
+    monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+
+    runner.running = True
+    await runner.simulate_user_lifecycle(1)
+    assert callback_calls and callback_calls[0][0] == 2
+    assert callback_calls[0][1]["flowInstance"] == 2
+
+
+@pytest.mark.asyncio
+async def test_start_and_stop_generating_updates_active_count(monkeypatch, base_config, empty_flow):
+    runner = make_runner(base_config, empty_flow)
+
+    async def fake_user(user_id):
+        async with runner.lock:
+            runner._active_users_count += 1
+        try:
+            while runner.running:
+                await original_sleep(0)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            async with runner.lock:
+                runner._active_users_count -= 1
+
+    monkeypatch.setattr(runner, "simulate_user_lifecycle", fake_user)
+    original_sleep = asyncio.sleep
+    monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+
+    task = asyncio.create_task(runner.start_generating())
+    await original_sleep(0)
+    await original_sleep(0)
+    assert runner.get_active_user_count() == 1
+    await runner.stop_generating()
+    await task
+    assert runner.get_active_user_count() == 0
+
 
 
 
