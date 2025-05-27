@@ -8,13 +8,13 @@ from datetime import datetime
 import resource
 from typing import Any, Dict, Optional, List
 
-# Import all flow generator functionality
-from flow_generator import (
+# Import all flow runner functionality
+from flow_runner import (
     StartRequest,
-    FlowGenerator,
+    FlowRunner,
     Metrics,
     asyncio,
-    logger as fg_logger
+    logger as fr_logger
 )
 
 from fastapi import FastAPI, HTTPException
@@ -45,7 +45,7 @@ current_settings = {
     'container_status': 'running'
 }
 
-flow_generator_instance = None  # type: Optional[FlowGenerator]
+flow_runner_instance = None  # type: Optional[FlowRunner]
 event_loop = None               # type: Optional[asyncio.AbstractEventLoop]
 background_thread = None        # type: Optional[threading.Thread]
 
@@ -96,22 +96,22 @@ def _ensure_config_flowmap_structure(data: dict) -> dict:
 # ---------------------------------------------------------------------
 # FORCE-STOP HELPER
 # ---------------------------------------------------------------------
-def _force_stop_flow_generator():
+def _force_stop_flow_runner():
     """
-    Immediately stop the flow generator if it exists and is running,
+    Immediately stop the flow runner if it exists and is running,
     then set status to 'stopped' and clear references.
     """
-    global flow_generator_instance, event_loop
+    global flow_runner_instance, event_loop
 
-    if not flow_generator_instance or not flow_generator_instance.running:
-        logger.info("No running flow generator instance to stop forcibly.")
+    if not flow_runner_instance or not flow_runner_instance.running:
+        logger.info("No running flow runner instance to stop forcibly.")
         current_settings['app_status'] = 'stopped'
-        flow_generator_instance = None
+        flow_runner_instance = None
         return
 
-    logger.info("Forcibly stopping existing flow generator...")
+    logger.info("Forcibly stopping existing flow runner...")
 
-    instance = flow_generator_instance
+    instance = flow_runner_instance
     loop = event_loop
 
     try:
@@ -125,40 +125,40 @@ def _force_stop_flow_generator():
             logger.warning("Event loop unavailable or not running; forcing instance.running = False.")
             instance.running = False
     except Exception as e:
-        logger.error(f"Unexpected error forcibly stopping flow generator: {e}", exc_info=True)
+        logger.error(f"Unexpected error forcibly stopping flow runner: {e}", exc_info=True)
     finally:
         current_settings['app_status'] = 'stopped'
-        flow_generator_instance = None
-        logger.info("Flow generator forcibly stopped and marked as 'stopped'.")
+        flow_runner_instance = None
+        logger.info("Flow runner forcibly stopped and marked as 'stopped'.")
 
 # ---------------------------------------------------------------------
 # BACKGROUND THREAD ROUTINE
 # ---------------------------------------------------------------------
-def run_flow_generator_in_loop(start_request_data: StartRequest):
+def run_flow_runner_in_loop(start_request_data: StartRequest):
     """
     Dedicated background thread: creates an asyncio loop,
-    instantiates the flow generator, and runs until done.
+    instantiates the flow runner, and runs until done.
     """
-    global event_loop, flow_generator_instance
+    global event_loop, flow_runner_instance
 
     try:
         event_loop = asyncio.new_event_loop()
         asyncio.set_event_loop(event_loop)
 
-        flow_generator_instance = FlowGenerator(
+        flow_runner_instance = FlowRunner(
             config=start_request_data.config,
             flowmap=start_request_data.flowmap,
             metrics=Metrics()
         )
         logger.info("Starting flow generation based on flowmap...")
-        event_loop.run_until_complete(flow_generator_instance.start_generating())
+        event_loop.run_until_complete(flow_runner_instance.start_generating())
     except asyncio.CancelledError:
         logger.info("Flow generation cancelled.")
     except Exception as e:
-        logger.error(f"Background flow generator error: {e}", exc_info=True)
+        logger.error(f"Background flow runner error: {e}", exc_info=True)
         current_settings['app_status'] = 'error'
     finally:
-        logger.info("Background flow generator thread exiting.")
+        logger.info("Background flow runner thread exiting.")
         if current_settings['app_status'] not in ('error', 'stopped'):
             current_settings['app_status'] = 'stopped'
 
@@ -196,9 +196,9 @@ class StartRequestWrapper(BaseModel):
     flowmap: Dict[str, Any]
 
 @app.post('/api/start')
-async def start_flow_generator(data: dict):
+async def start_flow_runner(data: dict):
     """
-    Start the flow generator in a background thread using the provided flowmap.
+    Start the flow runner in a background thread using the provided flowmap.
     If already running, forcibly stop it first, then start with the new parameters.
     """
     global background_thread
@@ -208,19 +208,19 @@ async def start_flow_generator(data: dict):
 
     # If currently running, forcibly stop.
     if current_settings['app_status'] == 'running':
-        logger.info("Received /api/start while flow generator is already running. Forcing stop...")
-        _force_stop_flow_generator()
+        logger.info("Received /api/start while flow runner is already running. Forcing stop...")
+        _force_stop_flow_runner()
 
     # Validate request
     try:
         start_req_obj = StartRequest(**structured_data)
         logger.info("Start request validated successfully.")
-        # Set logging level for the flow generator based on debug
+        # Set logging level for the flow runner based on debug
         log_level = logging.DEBUG if start_req_obj.config.debug else logging.INFO
-        fg_logger.setLevel(log_level)
-        for handler in fg_logger.handlers:
+        fr_logger.setLevel(log_level)
+        for handler in fr_logger.handlers:
             handler.setLevel(log_level)
-        logger.info(f"Flow Generator log level set to {logging.getLevelName(log_level)}.")
+        logger.info(f"Flow Runner log level set to {logging.getLevelName(log_level)}.")
     except Exception as e:
         logger.error(f"Invalid request body: {e}", exc_info=True)
         current_settings['app_status'] = 'stopped'
@@ -229,33 +229,33 @@ async def start_flow_generator(data: dict):
     # Now we proceed to start fresh
     current_settings['app_status'] = 'running'
     background_thread = threading.Thread(
-        target=run_flow_generator_in_loop,
+        target=run_flow_runner_in_loop,
         args=(start_req_obj,),
         daemon=True
     )
     background_thread.start()
 
-    return JSONResponse({"message": "Flow generator started with the provided flowmap"})
+    return JSONResponse({"message": "Flow runner started with the provided flowmap"})
 
 @app.post('/api/stop')
-async def stop_flow_generator():
+async def stop_flow_runner():
     """
-    Immediately stops the running flow generator (if any) and sets status to 'stopped'.
+    Immediately stops the running flow runner (if any) and sets status to 'stopped'.
     If already stopped, returns a message that it's stopped.
     """
     if current_settings['app_status'] != 'running':
         # If we are 'stopped' or 'error' or 'initializing', there's nothing to do
         if current_settings['app_status'] == 'stopped':
-            return JSONResponse({"message": "Flow generator is already stopped."})
-        return JSONResponse({"message": f"No running flow generator to stop (status={current_settings['app_status']})."})
+            return JSONResponse({"message": "Flow runner is already stopped."})
+        return JSONResponse({"message": f"No running flow runner to stop (status={current_settings['app_status']})."})
 
-    _force_stop_flow_generator()
-    return JSONResponse({"message": "Flow generator forcibly stopped."})
+    _force_stop_flow_runner()
+    return JSONResponse({"message": "Flow runner forcibly stopped."})
 
 @app.get('/api/metrics')
 async def api_metrics():
     """
-    Return combined container + flow generator stats.
+    Return combined container + flow runner stats.
     Generator metrics are placed under the top-level 'metrics' key.
     """
     container_cpu_percent = psutil.cpu_percent(interval=0.1)
@@ -266,7 +266,7 @@ async def api_metrics():
     active_users = 0
     avg_flow_duration = 0.0
 
-    instance = flow_generator_instance
+    instance = flow_runner_instance
     loop = event_loop
 
     if instance and instance.running:
@@ -338,7 +338,7 @@ async def api_metrics():
 @app.get('/metrics')
 async def metrics_prometheus():
     """
-    Prometheus /metrics endpoint with combined container + flow generator stats.
+    Prometheus /metrics endpoint with combined container + flow runner stats.
     """
     container_cpu_percent = psutil.cpu_percent(interval=0.1)
     container_mem = psutil.virtual_memory()
@@ -348,7 +348,7 @@ async def metrics_prometheus():
     active_users = 0
     avg_flow_ms = 0.0
 
-    instance = flow_generator_instance
+    instance = flow_runner_instance
     loop = event_loop
 
     if instance and instance.running:
@@ -421,18 +421,18 @@ async def metrics_prometheus():
         "# HELP container_network_packets_recv_total Packets received.",
         "# TYPE container_network_packets_recv_total counter",
         f"container_network_packets_recv_total {net_io.packets_recv}",
-        "# HELP flow_generator_rps Current requests-per-second generated by flows.",
-        "# TYPE flow_generator_rps gauge",
-        f"flow_generator_rps {float(rps_val)}",
-        "# HELP flow_generator_active_users Current number of active simulated users executing flows.",
-        "# TYPE flow_generator_active_users gauge",
-        f"flow_generator_active_users {active_users}",
+        "# HELP flow_runner_rps Current requests-per-second generated by flows.",
+        "# TYPE flow_runner_rps gauge",
+        f"flow_runner_rps {float(rps_val)}",
+        "# HELP flow_runner_active_users Current number of active simulated users executing flows.",
+        "# TYPE flow_runner_active_users gauge",
+        f"flow_runner_active_users {active_users}",
         "# HELP app_status Application status (initializing=0, running=1, stopped=2, error=3).",
         "# TYPE app_status gauge",
         f"app_status {app_status_val}",
-        "# HELP flow_generator_average_duration_ms Average user flow duration in milliseconds.",
-        "# TYPE flow_generator_average_duration_ms gauge",
-        f"flow_generator_average_duration_ms {avg_flow_ms}",
+        "# HELP flow_runner_average_duration_ms Average user flow duration in milliseconds.",
+        "# TYPE flow_runner_average_duration_ms gauge",
+        f"flow_runner_average_duration_ms {avg_flow_ms}",
     ]
     return Response("\n".join(lines) + "\n", media_type="text/plain; version=0.0.4")
 
@@ -441,11 +441,11 @@ async def metrics_prometheus():
 # ---------------------------------------------------------------------
 def handle_signal(signum, frame):
     """
-    Handle SIGTERM/SIGINT to gracefully stop the flow generator.
+    Handle SIGTERM/SIGINT to gracefully stop the flow runner.
     """
     signal_name = signal.Signals(signum).name
     logger.info(f"Received signal {signal_name} ({signum}); initiating immediate shutdown.")
-    _force_stop_flow_generator()
+    _force_stop_flow_runner()
 
     logger.info("Exiting flow_container_control due to signal.")
     os._exit(0)

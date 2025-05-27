@@ -1,4 +1,4 @@
-# flow_generator.py
+# flow_runner.py
 
 import asyncio
 import aiohttp
@@ -21,7 +21,7 @@ import math # Needed for is_number check (isNaN)
 from typing import Annotated
 
 # --- Logging Setup ---
-logger = logging.getLogger("FlowGenerator")
+logger = logging.getLogger("FlowRunner")
 if not logger.hasHandlers():
     console_handler = logging.StreamHandler()
     console_handler.setLevel(logging.INFO)
@@ -34,7 +34,7 @@ logger.propagate = False # Prevent duplicate logs if root logger is configured
 
 # --- Exports for flow_container_control ---
 __all__ = [
-    "asyncio", "logger", "StartRequest", "FlowGenerator", "Metrics"
+    "asyncio", "logger", "StartRequest", "FlowRunner", "Metrics"
 ]
 
 # ---------------------------
@@ -474,9 +474,9 @@ def set_value_in_context(context: Dict[str, Any], key: str, value: Any):
 
 
 # ---------------------------
-# Flow Generator Class
+# Flow Runner Class
 # ---------------------------
-class FlowGenerator:
+class FlowRunner:
     def __init__(self, config: ContainerConfig, flowmap: FlowMap, metrics: Metrics):
         self.config = config
         self.flowmap = flowmap # This should be the validated Pydantic model instance
@@ -590,7 +590,7 @@ class FlowGenerator:
         self.default_port = 443 if self.original_scheme == 'https' else 80
         self.target_ip = self.config.flow_target_dns_override # Already validated by Pydantic
 
-        logger.info(f"Flow Generator Initialized: Target='{self.config.flow_target_url}', Target Sim Users={self.config.sim_users}, DNS Override={self.target_ip or 'None'}, Debug={self.config.debug}")
+        logger.info(f"Flow Runner Initialized: Target='{self.config.flow_target_url}', Target Sim Users={self.config.sim_users}, DNS Override={self.target_ip or 'None'}, Debug={self.config.debug}")
         flow_name = getattr(self.flowmap, 'name', 'N/A')
         num_steps = len(self.flowmap.steps) if self.flowmap and self.flowmap.steps else 0
         logger.info(f"Flow Loaded: {flow_name} ({num_steps} top-level steps)")
@@ -693,12 +693,12 @@ class FlowGenerator:
 
         # Wait for the stop signal
         if self._stopped_event:
-            logger.info("Flow generator main task waiting for stop signal...")
+            logger.info("Flow runner main task waiting for stop signal...")
             try:
                 await self._stopped_event.wait()
-                logger.info("Flow generator main task received stop signal via event.")
+                logger.info("Flow runner main task received stop signal via event.")
             except asyncio.CancelledError:
-                logger.info("Flow generator main task wait cancelled.")
+                logger.info("Flow runner main task wait cancelled.")
                 # Ensure event is set if cancelled externally, so stop_generating doesn't hang
                 if self._stopped_event and not self._stopped_event.is_set():
                     self._stopped_event.set()
@@ -706,8 +706,7 @@ class FlowGenerator:
         else:
              logger.error("Stop event was not initialized correctly. Cannot wait for stop.")
 
-
-        logger.debug("Flow generator start_generating coroutine finished.")
+        logger.debug("Flow runner start_generating coroutine finished.")
         # Cleanup and stopping is handled by stop_generating
 
     async def stop_generating(self):
@@ -795,7 +794,7 @@ class FlowGenerator:
         Uses the updated get_value_from_context which handles complex paths and returns _MISSING sentinel.
         """
         if isinstance(data, str):
-            # Special Token Substitution (##VAR:type:name##) - Primarily for body construction
+            # Special Token Substitution (##VAR:##) - Primarily for body construction
             if data.startswith("##VAR:") and data.endswith("##"):
                 try:
                     # Unpack the type and path, use maxsplit=1
@@ -1898,7 +1897,7 @@ class FlowGenerator:
                 chosen_ua_template = random.choice(self.user_agents_web if is_web_like else self.user_agents_api)
                 if not isinstance(chosen_ua_template, str):
                      logger.error(f"{user_log_prefix} (Iter {flow_iteration}): Invalid user agent template found: {chosen_ua_template}. Using default UA.")
-                     ua = "FlowGenerator/1.0" # Default fallback UA
+                     ua = "FlowRunner/1.0" # Default fallback UA
                 else:
                      ua = chosen_ua_template
                 base_session_headers["User-Agent"] = ua
@@ -1971,7 +1970,7 @@ class FlowGenerator:
                     flow_instance_end_time = time.monotonic()
                     flow_duration = flow_instance_end_time - flow_instance_start_time
 
-                    # Record duration only if flow completed without internal errors and generator is still running
+                    # Record duration only if flow completed without internal errors and runner is still running
                     if flow_completed_successfully and self.running:
                         await self.metrics.record_flow_duration(flow_duration)
                         logger.info(f"{user_log_prefix} (Iter {flow_iteration}): Flow instance finished successfully in {flow_duration:.3f} seconds.")
@@ -2001,7 +2000,7 @@ class FlowGenerator:
             # --- End of Main While Loop (self.running is False or task cancelled) ---
 
         except asyncio.CancelledError:
-            # Catch cancellation signal targeting the task itself (e.g., from stop_generating)
+            # Catch cancellation signal targeting the task itself (e.g., from stop_running)
             logger.info(f"{user_log_prefix}: Task received cancellation signal.")
             self.running = False # Ensure state consistency
 

@@ -18,7 +18,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy in your Python code
 COPY container_control.py .
-COPY flow_generator.py .
+COPY flow_runner.py .
 
 # Expose port 8080 for the FastAPI app
 EXPOSE 8080
