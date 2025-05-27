@@ -1,16 +1,22 @@
 # Contributor Guide for OpenAI Codex: FlowRunner Dockerized Component
 
-## 1. Project Overview & Current Goal
+## 1. Project Overview & Current Task
 
 **Project:** FlowRunner (Dockerized Automated API Flow Execution Engine)
 **Core Files:** `flow_runner.py` (core engine), `container_control.py` (FastAPI wrapper)
 **Current Task (Single, Comprehensive Mandate):**
 Your mission is to perform a significant update and testing phase for this project. This involves:
-1.  **Aligning Core Logic:** Update `flow_runner.py` to precisely match the operational logic of an external, feature-rich flow authoring application. This alignment covers variable extraction, conditional evaluation, loop processing, and specific JSON body value injection techniques, as detailed in the main specification document you have been provided (assume this is the "Aligning the Automated Flow Executor (`flow_runner.py`) with External Flow Definitions" document, Version 1.4 or similar).
-2.  **Implementing URL Override Feature:** Introduce a new, flexible URL construction mechanism in `flow_runner.py`. This will be controlled by a `ContainerConfig` boolean field named `override_step_url_host` (defaulting to `True`), as specified in the aforementioned document.
-3.  **Ensuring Always-Continuous Operation:** Refactor the `FlowRunner` class in `flow_runner.py` and its management within `container_control.py` so that any flow started via the `/api/start` endpoint **operates in a continuous loop by default**. The `ContainerConfig` model must include a `continuous_run: bool` field that defaults to `True`. The existing `self.delay` configuration (from `min_sleep_ms`/`max_sleep_ms`) will be used for pauses between steps *and* between full flow iterations in this continuous mode.
-4.  **Enhancing Validation & Logging:** Implement more robust input validation, clearer error handling in API responses, and more detailed logging for debugging, as outlined in the main specification document.
-5.  **Developing a Comprehensive Test Suite:** Create a full suite of unit tests for `flow_runner.py` and end-to-end (E2E) tests for the `container_control.py` API. These tests must strictly adhere to the "no external network access during test execution" constraint, utilizing mocks and a local mock HTTP server. Refer to `testplan.md` for specific test cases.
+1.  **Aligning Core Logic:** Update `flow_runner.py` to precisely match the operational logic of an external, feature-rich flow authoring application. This alignment covers variable extraction, conditional evaluation, loop processing, and specific JSON body value injection techniques, as detailed in the main specification document you have been provided (the "Aligning the Automated Flow Executor (`flow_runner.py`) with External Flow Definitions" document, Version 1.4 or similar).
+2.  **Implementing URL Override Feature:** Introduce a new, flexible URL construction mechanism in `flow_runner.py`. This will be controlled by a `ContainerConfig` boolean field named `override_step_url_host` (defaulting to `True`), as specified in the main specification document.
+3.  **Refining Always-Continuous Operation:** The `FlowRunner` class in `flow_runner.py` and its management in `container_control.py` **already operate in a continuous loop by design** when a flow is started via `/api/start`. Your task is to ensure this continuous operation is robust:
+    *   After each full flow iteration completes successfully, and if `self.state.stopRequested` is `False`, the `FlowRunner` must use `asyncio.sleep(self.delay)` (using the existing `self.delay` for inter-step delay, which also serves as the delay between full flow iterations) before automatically starting the next iteration.
+    *   The context for each new continuous iteration must be correctly reset to the initial `staticVars` of the flow.
+    *   The `onIterationStart` callback should be invoked before each subsequent iteration (i.e., not the very first one).
+    *   The `stop()` method must reliably terminate this continuous loop and cancel any pending inter-iteration sleep.
+    *   The `reset()` method must correctly handle context resets for new iterations versus a full stop.
+    *   **No `continuous_run` boolean parameter is needed in `ContainerConfig` or the `/api/start` payload for this component; continuous operation is inherent.**
+4.  **Enhancing Validation & Logging:** Implement improved input validation, clearer error handling in API responses, and more detailed logging for debugging, as outlined in the main specification document.
+5.  **Developing a Comprehensive Test Suite:** Create a full suite of unit tests for `flow_runner.py` and end-to-end (E2E) tests for the `container_control.py` API. These tests must strictly adhere to the "no external network access during test execution" constraint, utilizing mocks and a local mock HTTP server. Refer to `testplan.md` for specific test cases to cover.
 
 ## 2. Key Files for Modification & Reference
 
