@@ -41,6 +41,8 @@ from typing import Any, Dict
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import logging
+import aiohttp
 
 from flow_runner import (
     FlowRunner,
@@ -118,6 +120,15 @@ def test_extract_data_status_headers_and_body(base_config, empty_flow):
     assert ctx["user_id2"] == 1
 
 
+def test_extract_data_non_dict_body(base_config, empty_flow):
+    runner = make_runner(base_config, empty_flow)
+    ctx: Dict[str, Any] = {}
+    body = "plain text"
+    headers = {}
+    runner._extract_data(body, {"user": "user.id"}, ctx, 200, headers)
+    assert ctx["user"] is None
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "operator,left,right,expected",
@@ -145,6 +156,28 @@ async def test_evaluate_structured_condition(operator, left, right, expected, ba
     ctx = {"val": left}
     data = ConditionData(variable="val", operator=operator, value=right)
     assert runner._evaluate_structured_condition(data, ctx) is expected
+
+
+@pytest.mark.asyncio
+async def test_evaluate_structured_condition_edge_cases(base_config, empty_flow, caplog):
+    runner = make_runner(base_config, empty_flow)
+
+    ctx = {"val": "abc"}
+    data = ConditionData(variable="val", operator="matches_regex", value="(")
+    with caplog.at_level(logging.ERROR, logger="FlowRunner"):
+        assert runner._evaluate_structured_condition(data, ctx) is False
+
+    ctx_nan = {"val": float('nan')}
+    data_nan = ConditionData(variable="val", operator="greater_than", value="1")
+    assert runner._evaluate_structured_condition(data_nan, ctx_nan) is False
+
+    ctx_num = {"val": 5}
+    data_bad = ConditionData(variable="val", operator="less_than", value="abc")
+    assert runner._evaluate_structured_condition(data_bad, ctx_num) is False
+
+    ctx_bool = {"val": "true"}
+    data_bool = ConditionData(variable="val", operator="is_true", value="")
+    assert runner._evaluate_structured_condition(data_bool, ctx_bool) is False
 
 
 @pytest.mark.asyncio
@@ -200,6 +233,85 @@ async def test_execute_request_step_url_override(empty_flow):
 
 
 @pytest.mark.asyncio
+async def test_execute_request_step_url_override_preserves_query_and_fragment(empty_flow):
+    cfg = ContainerConfig(flow_target_url="http://base.com", sim_users=1)
+    runner = make_runner(cfg, empty_flow)
+
+    resp = AsyncMock()
+    resp.status = 200
+    resp.headers = {"Content-Type": "application/json"}
+    resp.json = AsyncMock(return_value={})
+    resp.text = AsyncMock(return_value="{}")
+    resp.read = AsyncMock(return_value=b"{}")
+    session = MagicMock()
+    cm = AsyncMock()
+    cm.__aenter__.return_value = resp
+    cm.__aexit__.return_value = AsyncMock()
+    session.request.return_value = cm
+
+    step = RequestStep(id="s1", type="request", method="GET", url="http://other.com/p?a=1#frag", onFailure="continue")
+    await runner._execute_request_step(step, session, {}, {}, {})
+    assert session.request.call_args.args[1] == "http://base.com/p?a=1#frag"
+
+
+@pytest.mark.asyncio
+async def test_execute_request_step_dns_override_host_header(empty_flow):
+    cfg = ContainerConfig(flow_target_url="http://base.com", sim_users=1, flow_target_dns_override="1.2.3.4")
+    runner = make_runner(cfg, empty_flow)
+
+    resp = AsyncMock()
+    resp.status = 200
+    resp.headers = {"Content-Type": "application/json"}
+    resp.json = AsyncMock(return_value={})
+    resp.text = AsyncMock(return_value="{}")
+    resp.read = AsyncMock(return_value=b"{}")
+    session = MagicMock()
+    cm = AsyncMock()
+    cm.__aenter__.return_value = resp
+    cm.__aexit__.return_value = AsyncMock()
+    session.request.return_value = cm
+
+    step = RequestStep(id="s1", type="request", method="GET", url="http://other.com/path", onFailure="continue")
+    await runner._execute_request_step(step, session, {}, {}, {})
+    called_url = session.request.call_args.args[1]
+    called_headers = session.request.call_args.kwargs["headers"]
+    assert called_url == "http://1.2.3.4/path"
+    assert called_headers["Host"] == "base.com"
+
+
+@pytest.mark.asyncio
+async def test_execute_request_step_dns_override_absolute_url(empty_flow):
+    cfg = ContainerConfig(flow_target_url="http://base.com", sim_users=1, flow_target_dns_override="1.2.3.4", override_step_url_host=False)
+    runner = make_runner(cfg, empty_flow)
+
+    resp = AsyncMock()
+    resp.status = 200
+    resp.headers = {"Content-Type": "application/json"}
+    resp.json = AsyncMock(return_value={})
+    resp.text = AsyncMock(return_value="{}")
+    resp.read = AsyncMock(return_value=b"{}")
+    session = MagicMock()
+    cm = AsyncMock()
+    cm.__aenter__.return_value = resp
+    cm.__aexit__.return_value = AsyncMock()
+    session.request.return_value = cm
+
+    step_same = RequestStep(id="s1", type="request", method="GET", url="http://base.com/a", onFailure="continue")
+    await runner._execute_request_step(step_same, session, {}, {}, {})
+    called_url = session.request.call_args.args[1]
+    called_headers = session.request.call_args.kwargs["headers"]
+    assert called_url == "http://1.2.3.4/a"
+    assert called_headers["Host"] == "base.com"
+
+    step_diff = RequestStep(id="s2", type="request", method="GET", url="http://other.com/a", onFailure="continue")
+    await runner._execute_request_step(step_diff, session, {}, {}, {})
+    second_url = session.request.call_args.args[1]
+    second_headers = session.request.call_args.kwargs["headers"]
+    assert second_url == "http://other.com/a"
+    assert "Host" not in second_headers
+
+
+@pytest.mark.asyncio
 async def test_execute_request_step_on_failure(empty_flow):
     cfg = ContainerConfig(flow_target_url="http://base.com", sim_users=1)
     runner = make_runner(cfg, empty_flow)
@@ -224,6 +336,77 @@ async def test_execute_request_step_on_failure(empty_flow):
     ctx2: Dict[str, Any] = {}
     await runner._execute_request_step(step2, session, {}, {}, ctx2)
     assert ctx2.get("flow_error") is None
+
+
+@pytest.mark.asyncio
+async def test_execute_request_step_retries_server_error(monkeypatch, empty_flow):
+    cfg = ContainerConfig(flow_target_url="http://base.com", sim_users=1)
+    runner = make_runner(cfg, empty_flow)
+
+    resp1 = AsyncMock()
+    resp1.status = 503
+    resp1.headers = {"Content-Type": "application/json"}
+    resp1.json = AsyncMock(return_value={})
+    resp1.text = AsyncMock(return_value="{}")
+    resp1.read = AsyncMock(return_value=b"{}")
+
+    resp2 = AsyncMock()
+    resp2.status = 200
+    resp2.headers = {"Content-Type": "application/json"}
+    resp2.json = AsyncMock(return_value={})
+    resp2.text = AsyncMock(return_value="{}")
+    resp2.read = AsyncMock(return_value=b"{}")
+
+    session = MagicMock()
+    cm1 = AsyncMock(); cm1.__aenter__.return_value = resp1; cm1.__aexit__.return_value = AsyncMock()
+    cm2 = AsyncMock(); cm2.__aenter__.return_value = resp2; cm2.__aexit__.return_value = AsyncMock()
+    session.request.side_effect = [cm1, cm2]
+
+    monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+
+    step = RequestStep(id="s1", type="request", method="GET", url="/a", onFailure="continue")
+    await runner._execute_request_step(step, session, {}, {}, {})
+    assert session.request.call_count == 2
+    assert runner.metrics.increment.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_execute_request_step_retries_connection_error(monkeypatch, empty_flow):
+    cfg = ContainerConfig(flow_target_url="http://base.com", sim_users=1)
+    runner = make_runner(cfg, empty_flow)
+
+    resp = AsyncMock()
+    resp.status = 200
+    resp.headers = {"Content-Type": "application/json"}
+    resp.json = AsyncMock(return_value={})
+    resp.text = AsyncMock(return_value="{}")
+    resp.read = AsyncMock(return_value=b"{}")
+
+    cm_success = AsyncMock(); cm_success.__aenter__.return_value = resp; cm_success.__aexit__.return_value = AsyncMock()
+    session = MagicMock()
+    session.request.side_effect = [aiohttp.ClientConnectionError(), cm_success]
+
+    monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+
+    step = RequestStep(id="s1", type="request", method="GET", url="/a", onFailure="continue")
+    await runner._execute_request_step(step, session, {}, {}, {})
+    assert session.request.call_count == 2
+    assert runner.metrics.increment.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_execute_request_step_metrics_not_incremented_on_failure(monkeypatch, empty_flow):
+    cfg = ContainerConfig(flow_target_url="http://base.com", sim_users=1)
+    runner = make_runner(cfg, empty_flow)
+
+    session = MagicMock()
+    session.request.side_effect = aiohttp.ClientConnectionError()
+
+    monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+
+    step = RequestStep(id="s1", type="request", method="GET", url="/a", onFailure="continue")
+    await runner._execute_request_step(step, session, {}, {}, {})
+    assert runner.metrics.increment.await_count == 0
 
 
 @pytest.mark.asyncio

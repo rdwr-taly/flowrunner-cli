@@ -41,21 +41,23 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../.
 import asyncio
 import httpx
 import pytest
+import pytest_asyncio
 
 import container_control
 from tests.e2e.mock_server import create_mock_server, shutdown_mock_server
 
 
-@pytest.fixture
+@pytest_asyncio.fixture
 async def mock_server():
     runner, base_url, hits = await create_mock_server()
     yield {'base_url': base_url, 'hits': hits}
     await shutdown_mock_server(runner)
 
 
-@pytest.fixture
+@pytest_asyncio.fixture
 async def api_client():
-    async with httpx.AsyncClient(app=container_control.app, base_url="http://testserver") as client:
+    transport = httpx.ASGITransport(app=container_control.app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
         yield client
     container_control._force_stop_flow_runner()
     if container_control.background_thread:
