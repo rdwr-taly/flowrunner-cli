@@ -249,3 +249,14 @@ This is a **new feature** for `flow_runner.py` to enhance portability of flows, 
 *   **Logging:** Ensure all new logic paths and important decisions are clearly logged.
 
 By meticulously addressing these points, the AI agent can successfully upgrade the automated flow executor to meet the new requirements for interoperability and advanced feature support.
+
+---
+
+## Project Roadmap
+
+### v1.1.0 (Current)
+
+- [x] **Continuous Flow Runner (Simplified):** FlowRunner now runs indefinitely when started via the API and resets context between iterations.
+- [x] **Validation & Error Handling Improvements:** API responses and internal logging provide clearer details on invalid configurations and flow errors.
+- [x] **UI/UX Tweaks:** Logging levels can be adjusted via configuration; metrics endpoints expose detailed runtime information.
+- [x] **Automated Testing Framework:** Unit and end-to-end test suites exercise the FlowRunner core and API.

@@ -9,7 +9,15 @@ import psutil # Although imported, psutil is not used in the provided code. Keep
 from typing import List, Dict, Any, Optional, Union, Literal
 import logging
 import re
-from pydantic import BaseModel, Field, validator, RootModel, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    validator,
+    RootModel,
+    field_validator,
+    model_validator,
+    ConfigDict,
+)
 from ipaddress import ip_address, AddressValueError
 from urllib.parse import urlparse, urlunparse, quote, unquote # Added unquote for URL param validation
 from collections import deque
@@ -128,6 +136,9 @@ class FlowMap(BaseModel):
     steps: List[FlowStep] = Field(..., description="The sequence of steps defining the flow")
     staticVars: Optional[Dict[str, Any]] = Field(default_factory=dict, description="Global static variables accessible anywhere in the flow (referenced as {{varName}}). Values can be strings, numbers, booleans.") # Allow Any type
 
+    # Ignore any extra fields when parsing flow definitions
+    model_config = ConfigDict(extra="ignore")
+
 # Ensure FlowMap uses the updated FlowStep
 FlowMap.model_rebuild()
 
@@ -135,6 +146,7 @@ FlowMap.model_rebuild()
 # Configuration Models (Container & Start Request)
 # ---------------------------
 class ContainerConfig(BaseModel):
+    """Runtime configuration for FlowRunner."""
     flow_target_url: str = Field(..., description="Base URL for the target application of the flow")
     flow_target_dns_override: Optional[str] = Field(None, description="IP address to use instead of DNS lookup for the target hostname")
     xff_header_name: str = Field(default="X-Forwarded-For", description="Header name for injecting the fake source IP")
@@ -142,6 +154,14 @@ class ContainerConfig(BaseModel):
     min_sleep_ms: int = Field(default=100, ge=0, description="Minimum sleep time (ms) between steps in a flow")
     max_sleep_ms: int = Field(default=1000, ge=0, description="Maximum sleep time (ms) between steps in a flow")
     debug: bool = Field(default=False, description="Enable debug logging for flow generator")
+    override_step_url_host: bool = Field(
+        default=True,
+        description=(
+            "If true, 'flow_target_url' exclusively forms the request base (scheme, host, port), "
+            "using only path/query/fragment from step.url. Step.url's host info is ignored. "
+            "If false, step.url logic (honoring its own host or {{baseURL}}) is prioritized."
+        ),
+    )
 
     class Config:
         populate_by_name = True
@@ -152,7 +172,8 @@ class ContainerConfig(BaseModel):
             'sim_users': 'Simulated Users',
             'min_sleep_ms': 'Minimum Step Sleep MS',
             'max_sleep_ms': 'Maximum Step Sleep MS',
-            'debug': 'Debug'
+            'debug': 'Debug',
+            'override_step_url_host': 'Override Step URL Host'
         }.get(field_name, field_name)
         extra = "allow" # Allow extra fields but ignore them
 
@@ -476,8 +497,19 @@ def set_value_in_context(context: Dict[str, Any], key: str, value: Any):
 # ---------------------------
 # Flow Runner Class
 # ---------------------------
+from typing import Callable
+
+
 class FlowRunner:
-    def __init__(self, config: ContainerConfig, flowmap: FlowMap, metrics: Metrics):
+    """Executes flows continuously using asynchronous HTTP requests."""
+    def __init__(
+        self,
+        config: ContainerConfig,
+        flowmap: FlowMap,
+        metrics: Metrics,
+        *,
+        on_iteration_start: Optional[Callable[[int, Dict[str, Any]], Any]] = None,
+    ):
         self.config = config
         self.flowmap = flowmap # This should be the validated Pydantic model instance
         self.metrics = metrics
@@ -486,7 +518,8 @@ class FlowRunner:
         self._stopped_event: Optional[asyncio.Event] = None # To signal the main loop to stop
         # _active_users_count tracks actively running simulate_user_lifecycle coroutines
         self._active_users_count = 0
-        self.lock = asyncio.Lock() # Lock for managing user_tasks and _active_users_count
+        self.lock = asyncio.Lock()  # Lock for managing user_tasks and _active_users_count
+        self.on_iteration_start = on_iteration_start
 
         self.configure_logging(self.config.debug)
 
@@ -672,7 +705,7 @@ class FlowRunner:
         )
 
     async def start_generating(self):
-        """Starts the flow generation process and waits until stopped."""
+        """Start all simulated user tasks and run continuously until stopped."""
         async with self.lock: # Protect access to running flag and user_tasks list
             if self.running:
                 logger.warning("Flow generation is already running.")
@@ -780,6 +813,24 @@ class FlowRunner:
         self._active_users_count = 0 # Direct assignment ok since we are managing stop sequence
         logger.info(f"Flow generation stopped. Reset active user count from {final_count_before_reset} to 0.")
         # Note: self.running flag is already False
+
+    # ------------------------------------------------------------------
+    # Compatibility helpers for continuous-run API
+    # ------------------------------------------------------------------
+    async def run(self):
+        """Alias for start_generating to match older interface."""
+        await self.start_generating()
+
+    async def stop(self):
+        """Alias for stop_generating for API clarity."""
+        await self.stop_generating()
+
+    async def reset(self):
+        """Reset internal state without starting a new run."""
+        await self.stop_generating()
+        async with self.lock:
+            self.user_tasks = []
+            self._active_users_count = 0
 
     def get_active_user_count(self) -> int:
         """Returns the current count of active user simulation tasks."""
@@ -1209,6 +1260,10 @@ class FlowRunner:
                     else:
                          # Use case-insensitive lookup on our prepared dict
                          extracted_value = ci_headers.get(effective_path.lower(), _MISSING) # Use _MISSING if header not found
+                elif path_lower == "body":
+                     source_description = "body"
+                     extracted_value = response_data
+                     effective_path = "body"
                 elif path_lower.startswith("body."):
                      source_description = "body"
                      effective_path = path_expr[len("body."):]
@@ -1291,72 +1346,82 @@ class FlowRunner:
                 set_value_in_context(context, f'{context_prefix}_error', f"Invalid URL format: {url_path_substituted}")
                 return False
 
-            # Check if substituted URL is absolute or relative
-            if parsed_substituted_url.scheme and parsed_substituted_url.netloc:
-                # Absolute URL provided in step
-                final_url = url_path_substituted
-                step_host = parsed_substituted_url.hostname
-                # Apply DNS override only if host matches the configured target host
-                if self.target_ip and step_host == self.original_host:
-                    port = parsed_substituted_url.port or (443 if parsed_substituted_url.scheme == 'https' else 80)
-                    netloc_ip_part = f"[{self.target_ip}]" if ':' in self.target_ip else self.target_ip
-                    # Rebuild netloc with IP and port (only if non-default)
-                    netloc = f"{netloc_ip_part}:{port}" if (parsed_substituted_url.scheme == 'https' and port != 443) or \
-                                                        (parsed_substituted_url.scheme == 'http' and port != 80) else netloc_ip_part
-                    final_url = urlunparse(
-                        (parsed_substituted_url.scheme, netloc, parsed_substituted_url.path or '/', parsed_substituted_url.params, parsed_substituted_url.query, parsed_substituted_url.fragment)
-                    )
-                    host_header_override = step_host # Set Host header to original
-                    logger.debug(f"Step {step_identifier}: Applying DNS override to absolute URL -> {final_url} (Host: {host_header_override})")
-                else:
-                     logger.debug(f"Step {step_identifier}: Using absolute URL '{final_url}' directly (no DNS override applicable or host mismatch).")
-            else:
-                # Relative URL path provided in step
-                # Combine with configured target URL, handling DNS override if needed
-                base_url_config = self.config.flow_target_url.rstrip('/')
-                # Ensure path part is clean for joining
-                path_part = url_path_substituted.lstrip('./')
-
-                # --- Check for missing path parameters after substitution ---
-                # Example: If URL was "/api/items/{{itemId}}" and itemId is None -> "/api/items/"
-                # This check is crucial to prevent errors like the PUT /api/basketitems/ seen in logs.
-                required_params = re.findall(r"\{\{([\w\.\[\]]+?)\}\}", step.url)
-                if required_params:
-                    # Reconstruct the substituted path to check if params were filled
-                    # test_substituted_path = self._substitute_variables(step.url, context) # Already have path_part
-                    # Check if the final path ends with '/' which might indicate a missing final parameter
-                    # And ensure original template didn't also end with '/'
-                    if path_part.endswith('/') and not step.url.rstrip('/').endswith('/'):
-                         # More robust check: See if any required param evaluates to None or empty string
-                         missing_param_found = False
-                         for param in required_params:
-                              param_val = get_value_from_context(context, param)
-                              if param_val is _MISSING or param_val is None or param_val == "":
-                                   # Check if this param is expected at the end of the URL path template
-                                   # (or part of the last segment)
-                                   if step.url.rstrip('/').endswith(f"{{{{{param}}}}}"):
-                                        logger.error(f"Step {step_identifier}: URL path parameter '{{{{{param}}}}}' is missing or empty after substitution ('{url_path_substituted}'). Skipping request.")
-                                        set_value_in_context(context, f'{context_prefix}_status', 599)
-                                        set_value_in_context(context, f'{context_prefix}_error', f"Missing URL path parameter '{param}' in '{url_path_substituted}'")
-                                        missing_param_found = True
-                                        break # Found one missing param, no need to check others
-                         if missing_param_found:
-                              return False # Indicate internal failure
-
+            if self.config.override_step_url_host:
+                step_path = parsed_substituted_url.path or '/'
+                if not step_path.startswith('/'):
+                    step_path = '/' + step_path
+                step_query = parsed_substituted_url.query
+                step_fragment = parsed_substituted_url.fragment
 
                 if self.target_ip:
-                    # Use overridden base URL parts
                     port = self.parsed_url.port or self.default_port
-                    netloc_ip_part = f"[{self.target_ip}]" if ':' in self.target_ip else self.target_ip
-                    netloc = f"{netloc_ip_part}:{port}" if (self.original_scheme == 'https' and port != 443) or \
-                                                        (self.original_scheme == 'http' and port != 80) else netloc_ip_part
-                    final_url = urlunparse((self.original_scheme, netloc, path_part, '', '', ''))
-                    host_header_override = self.original_host # Need Host header for target service
-                    logger.debug(f"Step {step_identifier}: Applying DNS override to relative path '{path_part}' -> {final_url} (Host: {host_header_override})")
+                    ip_part = f"[{self.target_ip}]" if ':' in self.target_ip else self.target_ip
+                    netloc = (
+                        f"{ip_part}:{port}" if (self.original_scheme == 'https' and port != 443) or (self.original_scheme == 'http' and port != 80) else ip_part
+                    )
+                    host_header_override = self.original_host
                 else:
-                    # No DNS override, just join base and path
-                    final_url = f"{base_url_config}/{path_part}"
-                    logger.debug(f"Step {step_identifier}: Using relative path '{path_part}' with base URL -> {final_url}")
+                    netloc = self.parsed_url.netloc
+
+                final_url = urlunparse((self.original_scheme, netloc, step_path, '', step_query, step_fragment))
+                logger.debug(
+                    f"Step {step_identifier}: URL Override Active. Final URL: {final_url}" +
+                    (f" (Host header: {host_header_override})" if host_header_override else "")
+                )
+            else:
+                if parsed_substituted_url.scheme and parsed_substituted_url.netloc:
+                    final_url = url_path_substituted
+                    step_host = parsed_substituted_url.hostname
+                    if self.target_ip and step_host == self.original_host:
+                        port = parsed_substituted_url.port or (443 if parsed_substituted_url.scheme == 'https' else 80)
+                        ip_part = f"[{self.target_ip}]" if ':' in self.target_ip else self.target_ip
+                        netloc = (
+                            f"{ip_part}:{port}" if (parsed_substituted_url.scheme == 'https' and port != 443) or (parsed_substituted_url.scheme == 'http' and port != 80) else ip_part
+                        )
+                        final_url = urlunparse(
+                            (parsed_substituted_url.scheme, netloc, parsed_substituted_url.path or '/', parsed_substituted_url.params, parsed_substituted_url.query, parsed_substituted_url.fragment)
+                        )
+                        host_header_override = step_host
+                        logger.debug(
+                            f"Step {step_identifier}: DNS override applied to absolute URL -> {final_url} (Host: {host_header_override})"
+                        )
+                    else:
+                        logger.debug(f"Step {step_identifier}: Using absolute URL '{final_url}' directly (override inactive).")
+                else:
+                    base_url_config = self.config.flow_target_url.rstrip('/')
+                    path_part = url_path_substituted.lstrip('./')
+
+                    required_params = re.findall(r"\{\{([\w\.\[\]]+?)\}\}", step.url)
+                    if required_params and path_part.endswith('/') and not step.url.rstrip('/').endswith('/'):
+                        missing_param_found = False
+                        for param in required_params:
+                            param_val = get_value_from_context(context, param)
+                            if param_val is _MISSING or param_val is None or param_val == "":
+                                if step.url.rstrip('/').endswith(f"{{{{{param}}}}}"):
+                                    logger.error(
+                                        f"Step {step_identifier}: URL path parameter '{{{{{param}}}}}' is missing or empty after substitution ('{url_path_substituted}'). Skipping request."
+                                    )
+                                    set_value_in_context(context, f'{context_prefix}_status', 599)
+                                    set_value_in_context(context, f'{context_prefix}_error', f"Missing URL path parameter '{param}' in '{url_path_substituted}'")
+                                    missing_param_found = True
+                                    break
+                        if missing_param_found:
+                            return False
+
+                    if self.target_ip:
+                        port = self.parsed_url.port or self.default_port
+                        ip_part = f"[{self.target_ip}]" if ':' in self.target_ip else self.target_ip
+                        netloc = (
+                            f"{ip_part}:{port}" if (self.original_scheme == 'https' and port != 443) or (self.original_scheme == 'http' and port != 80) else ip_part
+                        )
+                        final_url = urlunparse((self.original_scheme, netloc, path_part, '', '', ''))
+                        host_header_override = self.original_host
+                        logger.debug(
+                            f"Step {step_identifier}: Applying DNS override to relative path '{path_part}' -> {final_url} (Host: {host_header_override})"
+                        )
+                    else:
+                        final_url = f"{base_url_config}/{path_part}"
+                        logger.debug(f"Step {step_identifier}: Using relative path '{path_part}' with base URL -> {final_url}")
 
 
             # --- Combine Headers ---
@@ -1600,6 +1665,85 @@ class FlowRunner:
              return False # Indicate step failed internally
 
 
+    async def _execute_loop_step(
+        self,
+        step: LoopStep,
+        session: aiohttp.ClientSession,
+        base_headers: Dict[str, str],
+        flow_headers: Dict[str, str],
+        context: Dict[str, Any],
+        depth: int,
+        user_id_log: str,
+    ) -> None:
+        """Executes a LoopStep with isolated iteration contexts."""
+        indent = "  " * depth
+        step_identifier = f"'{step.name}' ({step.id})" if step.name else f"({step.id})"
+
+        source_path = step.source
+        if source_path.startswith("{{") and source_path.endswith("}}"):
+            source_path = source_path[2:-2].strip()
+        else:
+            source_path = source_path.strip()
+
+        if not source_path:
+            logger.error(f"{indent}User {user_id_log}: Loop {step_identifier}: Source path is empty ('{step.source}'). Skipping loop.")
+            return
+
+        iterable_source = get_value_from_context(context, source_path)
+        if iterable_source is _MISSING:
+            logger.warning(f"{indent}User {user_id_log}: Loop {step_identifier}: Source variable '{source_path}' not found in context. Skipping loop.")
+            return
+        if not isinstance(iterable_source, list):
+            logger.warning(
+                f"{indent}User {user_id_log}: Loop {step_identifier}: Source '{source_path}' is not a list (type: {type(iterable_source).__name__}). Skipping loop."
+            )
+            return
+        if not iterable_source:
+            logger.info(f"{indent}User {user_id_log}: Loop {step_identifier}: Source '{source_path}' is an empty list. Skipping loop execution.")
+            return
+
+        item_count = len(iterable_source)
+        loop_var_name = step.loopVariable
+        logger.info(
+            f"{indent}User {user_id_log}: Loop {step_identifier}: Starting loop over {item_count} items from '{source_path}', loop var '{loop_var_name}'."
+        )
+
+        for index, item in enumerate(iterable_source):
+            if not self.running:
+                logger.info(f"{indent}  User {user_id_log}: Stop signal received, breaking loop {step_identifier}.")
+                break
+
+            loop_error_check = get_value_from_context(context, 'flow_error')
+            if loop_error_check is not _MISSING and loop_error_check is not None:
+                logger.warning(
+                    f"{indent}  User {user_id_log}: Flow error detected before loop iteration {index+1} ('{loop_error_check}'), breaking loop {step_identifier}."
+                )
+                break
+
+            logger.debug(f"{indent}  User {user_id_log}: Loop {step_identifier} - Iteration {index+1}/{item_count}")
+
+            try:
+                loop_context = copy.deepcopy(context)
+            except Exception as copy_err:
+                logger.error(
+                    f"{indent}  User {user_id_log}: Failed to deepcopy context for loop {step_identifier} iteration {index+1}: {copy_err}. Using shallow copy (RISKY)."
+                )
+                loop_context = context.copy()
+
+            set_value_in_context(loop_context, loop_var_name, item)
+            set_value_in_context(loop_context, f"{loop_var_name}_index", index)
+
+            await self._execute_steps(step.steps, session, base_headers, flow_headers, loop_context, depth + 1)
+
+            iteration_error = get_value_from_context(loop_context, 'flow_error')
+            if iteration_error is not _MISSING and iteration_error is not None:
+                logger.warning(
+                    f"{indent}  User {user_id_log}: Error detected within loop {step_identifier} iteration {index+1}: {iteration_error}"
+                )
+                set_value_in_context(context, 'flow_error', f"Error in loop {step_identifier} iter {index+1}: {iteration_error}")
+                break
+
+
     async def _execute_steps(
         self,
         steps: List[Union[FlowStep, Dict]], # Input list might contain dicts or models
@@ -1762,71 +1906,15 @@ class FlowRunner:
 
                 # --- Loop Step ---
                 elif isinstance(step_instance, LoopStep):
-                    source_path = None
-                    if step_instance.source and step_instance.source.startswith("{{") and step_instance.source.endswith("}}"):
-                        source_path = step_instance.source[2:-2].strip()
-                    else:
-                        source_path = step_instance.source.strip() # Allow direct path/variable name
-
-                    if not source_path:
-                         logger.error(f"{indent}User {user_id_log}: Loop {step_identifier}: Source path is empty ('{step_instance.source}'). Skipping loop.")
-                         continue # Skip to next step in sequence
-
-                    iterable_source = get_value_from_context(context, source_path)
-
-                    if iterable_source is _MISSING:
-                         logger.warning(f"{indent}User {user_id_log}: Loop {step_identifier}: Source variable '{source_path}' not found in context. Skipping loop.")
-                         continue
-                    if not isinstance(iterable_source, list):
-                         logger.warning(f"{indent}User {user_id_log}: Loop {step_identifier}: Source '{source_path}' is not a list (type: {type(iterable_source).__name__}). Skipping loop.")
-                         continue
-                    if not iterable_source:
-                         logger.info(f"{indent}User {user_id_log}: Loop {step_identifier}: Source '{source_path}' is an empty list. Skipping loop execution.")
-                         continue
-
-                    item_count = len(iterable_source)
-                    loop_var_name = step_instance.loopVariable
-                    logger.info(f"{indent}User {user_id_log}: Loop {step_identifier}: Starting loop over {item_count} items from '{source_path}', loop var '{loop_var_name}'.")
-
-                    loop_steps_data = step_instance.steps # List of dicts or models
-
-                    for index, item in enumerate(iterable_source):
-                        # Check running/error status before each iteration
-                        if not self.running: logger.info(f"{indent}  User {user_id_log}: Stop signal received, breaking loop {step_identifier}."); break
-                        loop_error_check = get_value_from_context(context, 'flow_error')
-                        if loop_error_check is not _MISSING and loop_error_check is not None:
-                            logger.warning(f"{indent}  User {user_id_log}: Flow error detected before loop iteration {index+1} ('{loop_error_check}'), breaking loop {step_identifier}."); break
-
-                        logger.debug(f"{indent}  User {user_id_log}: Loop {step_identifier} - Iteration {index+1}/{item_count}")
-
-                        # --- Create Isolated Context for Loop Iteration ---
-                        loop_context = {}
-                        try:
-                             # Deep copy to prevent modifications leaking between iterations or back to parent context
-                             loop_context = copy.deepcopy(context)
-                        except Exception as copy_err:
-                             logger.error(f"{indent}  User {user_id_log}: Failed to deepcopy context for loop {step_identifier} iteration {index+1}: {copy_err}. Using shallow copy (RISKY).")
-                             loop_context = context.copy() # Fallback, potential side effects
-
-                        # Set loop variables in the isolated context
-                        set_value_in_context(loop_context, loop_var_name, item)
-                        set_value_in_context(loop_context, f'{loop_var_name}_index', index) # Provide index
-
-                        # Execute loop steps with isolated context, increased depth
-                        # Pass the loop_steps_data list (containing dicts/models)
-                        await self._execute_steps(loop_steps_data, session, base_headers, flow_headers, loop_context, depth + 1)
-
-                        # Check for errors set *within* the loop iteration's context
-                        iteration_error = get_value_from_context(loop_context, 'flow_error')
-                        if iteration_error is not _MISSING and iteration_error is not None:
-                             logger.warning(f"{indent}  User {user_id_log}: Error detected within loop {step_identifier} iteration {index+1}: {iteration_error}")
-                             # Propagate error back to parent context to halt subsequent iterations/steps
-                             set_value_in_context(context, 'flow_error', f"Error in loop {step_identifier} iter {index+1}: {iteration_error}")
-                             break # Exit the for loop (will be caught by check at start of next outer loop)
-
-                        # No need to check self.running again here, outer loop check is sufficient
-
-                    # After loop finishes/breaks, error check at start of next step handles halting
+                    await self._execute_loop_step(
+                        step_instance,
+                        session,
+                        base_headers,
+                        flow_headers,
+                        context,
+                        depth,
+                        user_id_log,
+                    )
 
                 else: # Should be unreachable with validated models
                     logger.error(f"{indent}User {user_id_log}: Encountered unknown step instance type '{type(step_instance).__name__}' for {step_identifier}. Halting sequence.")
@@ -1881,7 +1969,7 @@ class FlowRunner:
             while self.running:
                 flow_iteration += 1
                 flow_instance_start_time = time.monotonic()
-                flow_epoch_start_time = time.time() # Wall clock time
+                flow_epoch_start_time = time.time()  # Wall clock time
 
                 # --- Generate Per-Flow State ---
                 fake_ip = self.generate_random_ip()
@@ -1924,6 +2012,17 @@ class FlowRunner:
 
                 # Get global flow headers definition (unsubstituted)
                 global_flow_headers_def = getattr(self.flowmap, 'headers', {}) or {}
+
+                if self.on_iteration_start and flow_iteration > 1:
+                    logger.debug(
+                        f"Calling on_iteration_start callback for iteration {flow_iteration} with context keys: {list(context.keys())}"
+                    )
+                    try:
+                        self.on_iteration_start(flow_iteration, context)
+                    except Exception as cb_err:
+                        logger.error(
+                            f"Error during on_iteration_start callback for iteration {flow_iteration}: {cb_err}"
+                        )
 
                 # --- Execute Flow within a Session ---
                 session = None
@@ -1990,7 +2089,9 @@ class FlowRunner:
                     # Prevent negative or excessively small rests
                     if rest_duration_s <= 0.001: rest_duration_s = 0.001
 
-                    logger.debug(f"{user_log_prefix}: Resting for {rest_duration_s:.3f} seconds before next iteration.")
+                    logger.info(
+                        f"{user_log_prefix}: Flow iteration {flow_iteration} complete, next in {rest_duration_s:.2f}s"
+                    )
                     try:
                         await asyncio.sleep(rest_duration_s)
                     except asyncio.CancelledError:
