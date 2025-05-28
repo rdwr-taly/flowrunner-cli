@@ -40,3 +40,4 @@ collect_code/
 collected_code*
 *.collected
 output_collected_code*
+output.text
