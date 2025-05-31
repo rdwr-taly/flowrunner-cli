@@ -19,7 +19,14 @@ from pydantic import (
     ConfigDict,
 )
 from ipaddress import ip_address, AddressValueError
-from urllib.parse import urlparse, urlunparse, quote, unquote # Added unquote for URL param validation
+from urllib.parse import (
+    urlparse,
+    urlunparse,
+    quote,
+    unquote,
+    parse_qsl,
+    urlencode,
+)
 from collections import deque
 import traceback
 import copy  # For deep copying the execution context in loops
@@ -1419,9 +1426,43 @@ class FlowRunner:
                         logger.debug(
                             f"Step {step_identifier}: Applying DNS override to relative path '{path_part}' -> {final_url} (Host: {host_header_override})"
                         )
+
                     else:
                         final_url = f"{base_url_config}/{path_part}"
-                        logger.debug(f"Step {step_identifier}: Using relative path '{path_part}' with base URL -> {final_url}")
+                        logger.debug(
+                            f"Step {step_identifier}: Using relative path '{path_part}' with base URL -> {final_url}"
+                        )
+
+            # --- Encode Query Parameter Values to Avoid WAF Issues ---
+            try:
+                if self.config.debug:
+                    logger.debug(
+                        f"Step {step_identifier}: URL before query re-encoding: {final_url}"
+                    )
+                parsed_final = urlparse(final_url)
+                if parsed_final.query:
+                    safe_qs = parsed_final.query.replace('+', '%2B')
+                    pairs = parse_qsl(safe_qs, keep_blank_values=True)
+                    encoded_query = urlencode(pairs, doseq=True, quote_via=quote)
+                    final_url = urlunparse(
+                        (
+                            parsed_final.scheme,
+                            parsed_final.netloc,
+                            parsed_final.path,
+                            parsed_final.params,
+                            encoded_query,
+                            parsed_final.fragment,
+                        )
+                    )
+                    if self.config.debug:
+                        logger.debug(
+                            f"Step {step_identifier}: URL after query re-encoding: {final_url}"
+                        )
+            except Exception as enc_err:
+                logger.error(
+                    f"Step {step_identifier}: Error re-encoding query parameters: {enc_err}",
+                    exc_info=self.config.debug,
+                )
 
 
             # --- Combine Headers ---

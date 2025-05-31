@@ -257,6 +257,30 @@ async def test_execute_request_step_url_override_preserves_query_and_fragment(em
 
 
 @pytest.mark.asyncio
+async def test_execute_request_step_query_param_plus_encoding(empty_flow):
+    cfg = ContainerConfig(flow_target_url="http://base.com", sim_users=1)
+    runner = make_runner(cfg, empty_flow)
+
+    resp = AsyncMock()
+    resp.status = 200
+    resp.headers = {"Content-Type": "application/json"}
+    resp.json = AsyncMock(return_value={})
+    resp.text = AsyncMock(return_value="{}")
+    resp.read = AsyncMock(return_value=b"{}")
+    session = MagicMock()
+    cm = AsyncMock()
+    cm.__aenter__.return_value = resp
+    cm.__aexit__.return_value = AsyncMock()
+    session.request.return_value = cm
+
+    step = RequestStep(id="s1", type="request", method="GET", url="/p?query={{val}}", onFailure="continue")
+    ctx = {"val": "value with+plus"}
+    await runner._execute_request_step(step, session, {}, {}, ctx)
+    called_url = session.request.call_args.args[1]
+    assert called_url == "http://base.com/p?query=value%20with%2Bplus"
+
+
+@pytest.mark.asyncio
 async def test_execute_request_step_dns_override_host_header(empty_flow):
     cfg = ContainerConfig(flow_target_url="http://base.com", sim_users=1, flow_target_dns_override="1.2.3.4")
     runner = make_runner(cfg, empty_flow)
