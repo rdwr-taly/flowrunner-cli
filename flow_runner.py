@@ -136,7 +136,13 @@ ConditionStep.model_rebuild()
 LoopStep.model_rebuild()
 
 class FlowMap(BaseModel):
-    id: Optional[str] = Field(None, description="Unique ID of the flowmap (optional, used for updates)") # Added ID field
+    id: Optional[str | int] = Field(
+        None,
+        description=(
+            "Unique ID of the flowmap (optional, used for updates). "
+            "May be numeric when supplied by external tooling."
+        ),
+    )
     name: str = Field(..., description="Name of the flow")
     description: Optional[str] = Field(None, description="Description of the flow")
     headers: Optional[Dict[str, str]] = Field(default_factory=dict, description="Global headers applied to all requests in the flow. Can contain {{variables}}.")

@@ -77,6 +77,11 @@ def make_runner(config: ContainerConfig, flow: FlowMap) -> FlowRunner:
     return runner
 
 
+def test_flowmap_accepts_numeric_id():
+    fm = FlowMap(id=12345, name="test", steps=[], staticVars={})
+    assert fm.id == 12345
+
+
 def test_init_override_step_url_host_default(base_config, empty_flow):
     runner = make_runner(base_config, empty_flow)
     assert runner.config.override_step_url_host is True
