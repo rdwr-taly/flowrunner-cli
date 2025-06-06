@@ -361,4 +361,42 @@ async def test_complex_flow_unquoted_variables(api_client, mock_server):
     assert {"number": 2, "flag": True} in bodies
     await api_client.post("/api/stop")
 
+
+@pytest.mark.asyncio
+async def test_flow_cycle_delay(api_client, mock_server):
+    flowmap = {
+        "name": "cycle_delay",
+        "steps": [
+            {
+                "id": "r1",
+                "type": "request",
+                "method": "GET",
+                "url": "/ping",
+                "onFailure": "continue",
+            }
+        ],
+    }
+    config = {
+        "flow_target_url": mock_server["base_url"],
+        "sim_users": 1,
+        "min_sleep_ms": 10,
+        "max_sleep_ms": 10,
+        "flow_cycle_delay_ms": 300,
+    }
+
+    resp = await api_client.post("/api/start", json={"config": config, "flowmap": flowmap})
+    assert resp.status_code == 200
+
+    await asyncio.sleep(0.7)
+    reqs = [r for r in mock_server["requests"] if r["path"] == "/ping"]
+    assert len(reqs) >= 2
+    delay = reqs[1]["timestamp"] - reqs[0]["timestamp"]
+    assert 0.25 <= delay <= 0.45
+
+    await api_client.post("/api/stop")
+    hits_after_stop = len(reqs)
+    await asyncio.sleep(0.4)
+    reqs_after = [r for r in mock_server["requests"] if r["path"] == "/ping"]
+    assert len(reqs_after) == hits_after_stop
+
 # Manual signal handling test (SIGTERM) should be performed via Docker: `docker kill -s TERM <container_id>` to verify graceful shutdown.
