@@ -175,6 +175,14 @@ class ContainerConfig(BaseModel):
             "If false, step.url logic (honoring its own host or {{baseURL}}) is prioritized."
         ),
     )
+    flow_cycle_delay_ms: Optional[int] = Field(
+        default=None,
+        ge=0,
+        description=(
+            "Fixed delay in milliseconds between flow iterations. "
+            "If not set, a random delay between min_sleep_ms and max_sleep_ms is used."
+        ),
+    )
 
     class Config:
         populate_by_name = True
@@ -186,7 +194,8 @@ class ContainerConfig(BaseModel):
             'min_sleep_ms': 'Minimum Step Sleep MS',
             'max_sleep_ms': 'Maximum Step Sleep MS',
             'debug': 'Debug',
-            'override_step_url_host': 'Override Step URL Host'
+            'override_step_url_host': 'Override Step URL Host',
+            'flow_cycle_delay_ms': 'Flow Cycle Delay MS'
         }.get(field_name, field_name)
         extra = "allow" # Allow extra fields but ignore them
 
@@ -199,6 +208,12 @@ class ContainerConfig(BaseModel):
                 raise ValueError(f"Invalid IP address provided for DNS Override: {v}")
         elif v == "":
             return None # Treat empty string as None
+        return v
+
+    @field_validator('flow_cycle_delay_ms')
+    def validate_cycle_delay(cls, v):
+        if v == "":
+            return None
         return v
 
     @model_validator(mode='after')
@@ -2127,14 +2142,16 @@ class FlowRunner:
 
                 # --- Inter-Flow Rest Period ---
                 if self.running:
-                    min_rest_s = self.config.min_sleep_ms / 1000.0
-                    max_rest_s = self.config.max_sleep_ms / 1000.0
-                    # Ensure min <= max after division
-                    if min_rest_s > max_rest_s: min_rest_s = max_rest_s
-
-                    rest_duration_s = random.uniform(min_rest_s, max_rest_s)
-                    # Prevent negative or excessively small rests
-                    if rest_duration_s <= 0.001: rest_duration_s = 0.001
+                    if self.config.flow_cycle_delay_ms is not None:
+                        rest_duration_s = max(self.config.flow_cycle_delay_ms / 1000.0, 0.001)
+                    else:
+                        min_rest_s = self.config.min_sleep_ms / 1000.0
+                        max_rest_s = self.config.max_sleep_ms / 1000.0
+                        if min_rest_s > max_rest_s:
+                            min_rest_s = max_rest_s
+                        rest_duration_s = random.uniform(min_rest_s, max_rest_s)
+                        if rest_duration_s <= 0.001:
+                            rest_duration_s = 0.001
 
                     logger.info(
                         f"{user_log_prefix}: Flow iteration {flow_iteration} complete, next in {rest_duration_s:.2f}s"
