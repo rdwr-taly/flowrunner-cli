@@ -1,4 +1,5 @@
 from aiohttp import web
+import time
 
 async def handle(request: web.Request) -> web.Response:
     hits = request.app['hits']
@@ -6,7 +7,7 @@ async def handle(request: web.Request) -> web.Response:
     path = request.path
     hits[path] = hits.get(path, 0) + 1
     body = await request.text()
-    requests.append({'path': path, 'method': request.method, 'headers': dict(request.headers), 'body': body})
+    requests.append({'path': path, 'method': request.method, 'headers': dict(request.headers), 'body': body, 'timestamp': time.monotonic()})
     return web.json_response({'path': path})
 
 async def create_mock_server():
