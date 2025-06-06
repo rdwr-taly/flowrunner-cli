@@ -13,6 +13,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("flow_url", nargs="?", default="http://localhost:8000", help="Base URL for flow target")
     parser.add_argument("sim_users", nargs="?", type=int, default=1, help="Number of simulated users")
     parser.add_argument("debug_level", nargs="?", default="INFO", help="Logging level (DEBUG, INFO, WARNING)")
+    parser.add_argument(
+        "--cycle-delay-ms",
+        dest="cycle_delay_ms",
+        type=int,
+        default=None,
+        help="Fixed delay between flow iterations in milliseconds",
+    )
     return parser.parse_args()
 
 
@@ -38,6 +45,7 @@ def main() -> None:
         flow_target_url=args.flow_url,
         sim_users=args.sim_users,
         debug=args.debug_level.upper() == "DEBUG",
+        flow_cycle_delay_ms=args.cycle_delay_ms,
     )
 
     loop = asyncio.new_event_loop()
