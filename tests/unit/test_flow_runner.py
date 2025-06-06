@@ -607,6 +607,54 @@ async def test_start_and_stop_generating_updates_active_count(monkeypatch, base_
     assert runner.get_active_user_count() == 0
 
 
+@pytest.mark.asyncio
+async def test_simulate_user_flow_cycle_delay(monkeypatch, empty_flow):
+    cfg = ContainerConfig(flow_target_url="http://example.com", sim_users=1, flow_cycle_delay_ms=200)
+    runner = make_runner(cfg, empty_flow)
+
+    monkeypatch.setattr(runner, "create_aiohttp_connector", lambda: MagicMock(closed=False, close=AsyncMock()))
+    monkeypatch.setattr(runner, "create_session", lambda conn: MagicMock(closed=False, close=AsyncMock()))
+    monkeypatch.setattr(runner, "_execute_steps", AsyncMock())
+
+    sleep_calls = []
+    original_sleep = asyncio.sleep
+
+    async def fake_sleep(d):
+        sleep_calls.append(d)
+        runner.running = False
+        await original_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", AsyncMock(side_effect=fake_sleep))
+
+    runner.running = True
+    await runner.simulate_user_lifecycle(1)
+    assert sleep_calls and sleep_calls[0] == 0.2
+
+
+@pytest.mark.asyncio
+async def test_simulate_user_flow_cycle_delay_min(monkeypatch, empty_flow):
+    cfg = ContainerConfig(flow_target_url="http://example.com", sim_users=1, flow_cycle_delay_ms=0)
+    runner = make_runner(cfg, empty_flow)
+
+    monkeypatch.setattr(runner, "create_aiohttp_connector", lambda: MagicMock(closed=False, close=AsyncMock()))
+    monkeypatch.setattr(runner, "create_session", lambda conn: MagicMock(closed=False, close=AsyncMock()))
+    monkeypatch.setattr(runner, "_execute_steps", AsyncMock())
+
+    sleep_calls = []
+    original_sleep = asyncio.sleep
+
+    async def fake_sleep(d):
+        sleep_calls.append(d)
+        runner.running = False
+        await original_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", AsyncMock(side_effect=fake_sleep))
+
+    runner.running = True
+    await runner.simulate_user_lifecycle(1)
+    assert sleep_calls and sleep_calls[0] == 0.001
+
+
 
 
 
