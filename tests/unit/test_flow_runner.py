@@ -619,6 +619,15 @@ def test_container_config_alias_override_step_url_host():
     assert cfg.override_step_url_host is False
 
 
+def test_container_config_alias_flow_cycle_delay_ms():
+    cfg = ContainerConfig(
+        flow_target_url="http://example.com",
+        sim_users=1,
+        **{"Flow Cycle Delay MS": 1500},
+    )
+    assert cfg.flow_cycle_delay_ms == 1500
+
+
 def test_container_config_validation_errors():
     pydantic = sys.modules["pydantic"]
     with pytest.raises(pydantic.ValidationError):

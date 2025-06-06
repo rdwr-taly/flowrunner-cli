@@ -28,6 +28,7 @@ FlowRunner is designed to execute flows exported from a companion graphical flow
     *   **Global Target URL:** Configure a primary base URL for all flow operations.
     *   **DNS Override:** Optionally override DNS resolution for the global target URL.
     *   **Override Step URL Host:** By default the host of every request comes from `flow_target_url`, with the step providing only path/query. Disable with `override_step_url_host: false`.
+    *   **Flow Cycle Delay:** Optionally specify a fixed wait time between flow iterations via `flow_cycle_delay_ms`.
 *   **Context Management:**
     *   Maintains an execution context that evolves as the flow progresses.
     *   Ensures context isolation for loop iterations.
@@ -83,6 +84,7 @@ Starts (or restarts) the FlowRunner with the provided configuration and flowmap.
     "max_sleep_ms": "integer (default: 1000, max ms between steps)",
     "debug": "boolean (default: false, enables verbose logging)"
     "override_step_url_host": "boolean (default: true, ignore host in step URLs)"
+    "flow_cycle_delay_ms": "integer (optional, fixed ms wait between flow cycles)"
     // Any other fields defined in ContainerConfig Pydantic model
   },
   "flowmap": {
