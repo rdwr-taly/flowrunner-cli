@@ -1,0 +1,64 @@
+# -----------------------------------------------------------------------------
+# Container Control Core v2.0 Configuration for FlowRunner
+# -----------------------------------------------------------------------------
+
+# --- Adapter Configuration (Required) ---
+adapter:
+  # Dotted-path import for the FlowRunner adapter class
+  class: flowrunner_adapter.FlowRunnerAdapter
+
+  # The key that MUST be present in the /api/start payload
+  # FlowRunner expects both 'config' and 'flowmap' in the payload
+  primary_payload_key: config
+
+  # Run as non-root user for security (optional)
+  # Set to null to run as root/default container user
+  run_as_user: null
+
+# -----------------------------------------------------------------------------
+# --- Core Process Management (Disabled) ---
+# FlowRunner manages its own async processes, so we don't need core process management
+process_management:
+  enabled: false
+
+# -----------------------------------------------------------------------------
+# --- Core Metrics Service (Optional) ---
+# Enable basic container metrics in addition to FlowRunner's own metrics
+metrics:
+  # Enable automatic collection of network I/O statistics
+  network_monitoring:
+    enabled: true
+    interface: "eth0"
+
+  # Process monitoring is not applicable since we don't use core process management
+  process_monitoring:
+    enabled: false
+
+# -----------------------------------------------------------------------------
+# --- Core Traffic Control (Optional) ---
+# Enable network shaping capabilities for load testing scenarios
+traffic_control:
+  enabled: false  # Disabled by default, can be enabled for specific test scenarios
+  interface: "eth0"
+  
+  # Keys in the /api/start payload for traffic control parameters
+  bandwidth_mbps_key: "bandwidth_limit_mbps"
+  default_bandwidth_mbps: 100
+  
+  latency_ms_key: "latency_ms" 
+  default_latency_ms: 0
+
+# -----------------------------------------------------------------------------
+# --- Privileged Commands (Optional) ---
+# Commands to run at different lifecycle stages
+privileged_commands:
+  # Commands to run before FlowRunner starts
+  pre_start: []
+    # Example: Tune network settings for high load
+    # - ["sysctl", "-w", "net.core.somaxconn=8192"]
+    # - ["sysctl", "-w", "net.core.netdev_max_backlog=5000"]
+  
+  # Commands to run after FlowRunner stops  
+  post_stop: []
+    # Example: Reset network settings
+    # - ["sysctl", "-w", "net.core.somaxconn=128"]
