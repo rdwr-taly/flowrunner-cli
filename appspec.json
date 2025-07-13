@@ -1,0 +1,237 @@
+{
+  "id": "flowrunner-cli",
+  "displayName": "FlowRunner CLI",
+  "description": "Advanced API flow generator that simulates complex user journeys and API interactions using predefined flowmaps.",
+  "icon": "fas fa-project-diagram",
+  "category": "Traffic Tools",
+  "subCategory": "API Simulation",
+  "deploymentContext": "app",
+  "image_id_ref": "flowrunner-cli-latest",
+  "taskLifecycle": "stateful",
+  
+  "deployment": {
+    "container_command_template": [
+      "python", "-m", "uvicorn", "container_control_core:app",
+      "--host", "0.0.0.0", "--port", "8080"
+    ],
+    "fixed_ports": [8080],
+    "default_env_vars": [
+      {
+        "name": "FLOW_TARGET_URL",
+        "label": "Target Base URL",
+        "type": "string",
+        "required": true,
+        "tooltip": "Base URL for the API endpoints (e.g., https://api.example.com)",
+        "default_value": "https://httpbin.org"
+      },
+      {
+        "name": "SIM_USERS", 
+        "label": "Simulated Users",
+        "type": "integer",
+        "required": true,
+        "default_value": 10,
+        "min": 1,
+        "max": 1000,
+        "tooltip": "Number of concurrent simulated users"
+      },
+      {
+        "name": "RAMP_UP_SECONDS",
+        "label": "Ramp Up Time (seconds)",
+        "type": "integer", 
+        "required": false,
+        "default_value": 30,
+        "min": 0,
+        "max": 3600,
+        "tooltip": "Time to gradually increase from 0 to target user count"
+      },
+      {
+        "name": "DURATION_SECONDS",
+        "label": "Test Duration (seconds)",
+        "type": "integer",
+        "required": false,
+        "default_value": 300,
+        "min": 10,
+        "max": 86400,
+        "tooltip": "Total duration to run the flow test (0 = infinite)"
+      },
+      {
+        "name": "THINK_TIME_MS",
+        "label": "Think Time (ms)",
+        "type": "integer",
+        "required": false,
+        "default_value": 1000,
+        "min": 0,
+        "max": 60000,
+        "tooltip": "Delay between requests in milliseconds"
+      },
+      {
+        "name": "REQUEST_TIMEOUT_MS",
+        "label": "Request Timeout (ms)",
+        "type": "integer",
+        "required": false,
+        "default_value": 30000,
+        "min": 1000,
+        "max": 300000,
+        "tooltip": "Timeout for individual requests"
+      },
+      {
+        "name": "FLOWMAP_JSON",
+        "label": "Flowmap Definition",
+        "type": "string",
+        "ui_type": "flowmap_select",
+        "required": true,
+        "tooltip": "JSON definition of the API flow to execute",
+        "default_value": "{\"name\": \"Basic Flow\", \"steps\": []}"
+      },
+      {
+        "name": "DEBUG",
+        "label": "Debug Mode",
+        "type": "boolean",
+        "required": false,
+        "default_value": false,
+        "tooltip": "Enable detailed logging and debug output"
+      },
+      {
+        "name": "ENABLE_METRICS",
+        "label": "Enable Detailed Metrics",
+        "type": "boolean", 
+        "required": false,
+        "default_value": true,
+        "tooltip": "Collect and report detailed performance metrics"
+      }
+    ]
+  },
+
+  "containerControl": {
+    "enabled": true,
+    "api_port_fixed": 8080,
+    "metrics_endpoint_path": "/api/metrics",
+    "actions": {
+      "start": {
+        "endpoint": "/api/start",
+        "method": "POST",
+        "payload_template_type": "custom",
+        "payload_template": {
+          "config": {
+            "flow_target_url": "{{env.FLOW_TARGET_URL}}",
+            "sim_users": "{{env.SIM_USERS}}",
+            "ramp_up_seconds": "{{env.RAMP_UP_SECONDS}}",
+            "duration_seconds": "{{env.DURATION_SECONDS}}",
+            "think_time_ms": "{{env.THINK_TIME_MS}}",
+            "request_timeout_ms": "{{env.REQUEST_TIMEOUT_MS}}",
+            "debug": "{{env.DEBUG}}",
+            "enable_metrics": "{{env.ENABLE_METRICS}}"
+          },
+          "flowmap": "{{env.FLOWMAP_JSON | json_parse}}"
+        }
+      },
+      "stop": {
+        "endpoint": "/api/stop",
+        "method": "POST"
+      },
+      "update_config": {
+        "endpoint": "/api/update",
+        "method": "POST",
+        "payload_template_type": "custom",
+        "payload_template": {
+          "config": {
+            "sim_users": "{{env.SIM_USERS}}",
+            "think_time_ms": "{{env.THINK_TIME_MS}}",
+            "debug": "{{env.DEBUG}}"
+          }
+        },
+        "updatable_fields": ["SIM_USERS", "THINK_TIME_MS", "DEBUG"]
+      }
+    }
+  },
+
+  "capabilities": {
+    "can_stop": true,
+    "can_resume": true,
+    "can_redeploy": true,
+    "can_edit_while_running": true
+  },
+
+  "monitoring": {
+    "prometheus": {
+      "enabled": true,
+      "scrape_path": "/metrics",
+      "scrape_port_number": 8080
+    },
+    "grafana": {
+      "dashboard_url_template": "/grafana/d/flowrunner-{{task.id}}/flowrunner-task-details"
+    }
+  },
+
+  "ui": {
+    "deployment_form_sections": [
+      {
+        "title": "Target Configuration",
+        "fields": ["FLOW_TARGET_URL", "FLOWMAP_JSON"]
+      },
+      {
+        "title": "Load Settings", 
+        "fields": ["SIM_USERS", "RAMP_UP_SECONDS", "DURATION_SECONDS", "THINK_TIME_MS"]
+      },
+      {
+        "title": "Advanced Options",
+        "fields": ["REQUEST_TIMEOUT_MS", "DEBUG", "ENABLE_METRICS"]
+      }
+    ],
+    "card_info_fields": [
+      {
+        "label": "Target URL",
+        "source_type": "env_var",
+        "source_name": "FLOW_TARGET_URL"
+      },
+      {
+        "label": "Simulated Users",
+        "source_type": "env_var", 
+        "source_name": "SIM_USERS"
+      },
+      {
+        "label": "Duration",
+        "source_type": "env_var",
+        "source_name": "DURATION_SECONDS",
+        "transform": "duration_seconds"
+      }
+    ],
+    "card_primary_metric": {
+      "label": "RPS",
+      "source_path": "metrics.rps",
+      "unit": "rps"
+    },
+    "card_secondary_metrics": [
+      {
+        "label": "Active Users",
+        "source_path": "metrics.active_simulated_users",
+        "unit": ""
+      },
+      {
+        "label": "Avg Response Time",
+        "source_path": "metrics.avg_response_time_ms",
+        "unit": "ms"
+      },
+      {
+        "label": "Success Rate", 
+        "source_path": "metrics.success_rate_percent",
+        "unit": "%"
+      }
+    ],
+    "card_basic_metrics": [
+      {
+        "label": "CPU",
+        "source_path": "container.cpu_percent",
+        "unit": "%",
+        "max_value": 100
+      },
+      {
+        "label": "Memory",
+        "source_path": "container.memory_percent", 
+        "unit": "%",
+        "max_value": 100
+      }
+    ],
+    "card_live_update_fields": ["SIM_USERS", "THINK_TIME_MS", "DEBUG"]
+  }
+}
