@@ -38,8 +38,8 @@ jobs:
           context: .
           push: true
           tags: |
-            youruser/yourrepo:${{ env.VERSION }}
-            youruser/yourrepo:latest
+            razor29/flowrunner-cli:${{ env.VERSION }}
+            razor29/flowrunner-cli:latest
           labels: |
             org.opencontainers.image.version=${{ env.VERSION }}
             org.opencontainers.image.description="Release ${{ env.VERSION }}"
