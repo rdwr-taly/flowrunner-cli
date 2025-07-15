@@ -1,7 +1,7 @@
 
 # FlowRunner (Automated API Flow Execution Engine)
 
-**Version:** 1.1.0
+**Version:** 1.1.3
 **Status:** Stable
 
 ## 1. Overview
@@ -15,7 +15,7 @@ FlowRunner is a powerful, UI-less engine designed for the automated execution of
 
 FlowRunner is designed to execute flows exported from a companion graphical flow authoring application, ensuring consistency between flow design and automated execution.
 
-## 2. Key Features (Version 1.1.0)
+## 2. Key Features (Version 1.1.3)
 
 *   **Flow Execution:**
     *   Runs multi-step API flows defined in a JSON format.
