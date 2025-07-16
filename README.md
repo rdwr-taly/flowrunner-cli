@@ -308,7 +308,7 @@ Defines iteration over a list.
 
 *   Inside the loop `steps`, `{{loopVariable}}` (e.g., `{{item}}`) and `{{loopVariable_index}}` will be available in the context.
 
-### 5.3. URL Construction Logic (Version 1.1.0 Behavior)
+### 5.3. URL Construction Logic (Version 1.1.3 Behavior)
 
 The final URL for each Request step depends on `override_step_url_host`:
 
@@ -322,7 +322,7 @@ The final URL for each Request step depends on `override_step_url_host`:
     *   If it is relative, it is appended to `flow_target_url`.
 4.  **DNS Override:** When `flow_target_dns_override` is set, requests are directed to that IP while the `Host` header reflects the original hostname.
 
-**URL Override Update (v1.1.0):** `config.override_step_url_host` now controls how final request URLs are built. When `true` (default) the scheme/host/port come exclusively from `flow_target_url` and the step only provides the path/query. Set to `false` to allow absolute step URLs as in v1.0.0.
+**URL Override Update (v1.1.3):** `config.override_step_url_host` now controls how final request URLs are built. When `true` (default) the scheme/host/port come exclusively from `flow_target_url` and the step only provides the path/query. Set to `false` to allow absolute step URLs as in v1.0.0.
 
 ## 6. Deployment & Usage (Docker)
 
@@ -330,11 +330,11 @@ Refer to the provided `Dockerfile` and `requirements.txt`.
 
 1.  **Build the Docker Image:**
     ```bash
-    docker build -t flowrunner-engine:1.1.0 .
+    docker build -t flowrunner-engine:1.1.3 .
     ```
 2.  **Run the Container:**
     ```bash
-    docker run -d -p 8080:8080 --name my-flowrunner flowrunner-engine:1.1.0
+    docker run -d -p 8080:8080 --name my-flowrunner flowrunner-engine:1.1.3
     ```
     *   The API will be available on `http://localhost:8080`.
     *   Consider volume mounting for persistent configurations or logs if needed.
