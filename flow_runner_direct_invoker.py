@@ -20,12 +20,32 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Fixed delay between flow iterations in milliseconds",
     )
+    parser.add_argument(
+        "--min-step-ms",
+        dest="min_step_ms",
+        type=int,
+        default=None,
+        help="Override min_sleep_ms for step delay",
+    )
+    parser.add_argument(
+        "--max-step-ms",
+        dest="max_step_ms",
+        type=int,
+        default=None,
+        help="Override max_sleep_ms for step delay",
+    )
+    parser.add_argument(
+        "--run-once",
+        dest="run_once",
+        action="store_true",
+        help="Execute the flow only once and then exit",
+    )
     return parser.parse_args()
 
 
-async def run_flow(cfg: ContainerConfig, fmap: FlowMap) -> None:
+async def run_flow(cfg: ContainerConfig, fmap: FlowMap, run_once: bool) -> None:
     metrics = Metrics()
-    runner = FlowRunner(cfg, fmap, metrics)
+    runner = FlowRunner(cfg, fmap, metrics, run_once=run_once)
     try:
         await runner.start_generating()
     finally:
@@ -46,12 +66,20 @@ def main() -> None:
         sim_users=args.sim_users,
         debug=args.debug_level.upper() == "DEBUG",
         flow_cycle_delay_ms=args.cycle_delay_ms,
+        **{
+            k: v
+            for k, v in {
+                "min_sleep_ms": args.min_step_ms,
+                "max_sleep_ms": args.max_step_ms,
+            }.items()
+            if v is not None
+        },
     )
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
-        loop.run_until_complete(run_flow(cfg, fmap))
+        loop.run_until_complete(run_flow(cfg, fmap, args.run_once))
     except KeyboardInterrupt:
         print("Stopping FlowRunner...")
         loop.run_until_complete(asyncio.sleep(0))

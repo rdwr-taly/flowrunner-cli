@@ -537,6 +537,7 @@ class FlowRunner:
         metrics: Metrics,
         *,
         on_iteration_start: Optional[Callable[[int, Dict[str, Any]], Any]] = None,
+        run_once: bool = False,
     ):
         self.config = config
         self.flowmap = flowmap # This should be the validated Pydantic model instance
@@ -548,6 +549,7 @@ class FlowRunner:
         self._active_users_count = 0
         self.lock = asyncio.Lock()  # Lock for managing user_tasks and _active_users_count
         self.on_iteration_start = on_iteration_start
+        self.run_once = run_once
 
         self.configure_logging(self.config.debug)
 
@@ -620,7 +622,7 @@ class FlowRunner:
             {"Accept": "application/vnd.api+json", "Connection": "keep-alive", "Authorization": "Bearer random_api_token", "X-API-Version": "2.0", "Accept-Encoding": "gzip, deflate, br"},
             {"Accept": "application/ld+json", "Connection": "keep-alive", "X-Correlation-ID": "some_correlation_id", "Content-Type": "application/json", "Accept-Encoding": "gzip, deflate"},
             {"Accept": "text/csv", "Connection": "keep-alive", "X-Auth-Token": "some_auth_token", "Accept-Encoding": "gzip, deflate, br", "Content-Type": "text/csv"},
-            {"Accept": "application/x-www-form-urlencoded", "Connection": "keep-alive", "Accept-Encoding": "gzip, deflate", "X-Client-Version": "1.1.0", "Content-Type": "application/x-www-form-urlencoded"},
+            {"Accept": "application/x-www-form-urlencoded", "Connection": "keep-alive", "Accept-Encoding": "gzip, deflate", "X-Client-Version": "1.1.3", "Content-Type": "application/x-www-form-urlencoded"},
             {"Accept": "application/protobuf", "Connection": "keep-alive", "Content-Type": "application/protobuf", "Accept-Encoding": "gzip, deflate"},
             {"Accept": "application/octet-stream", "Connection": "keep-alive", "Content-Type": "application/octet-stream", "Accept-Encoding": "gzip, deflate, br"},
             {"Accept": "application/graphql", "Connection": "keep-alive", "Content-Type": "application/graphql", "Accept-Encoding": "gzip, deflate"},
@@ -2142,6 +2144,12 @@ class FlowRunner:
 
                 # --- Inter-Flow Rest Period ---
                 if self.running:
+                    if self.run_once:
+                        logger.info(f"{user_log_prefix}: run_once enabled - stopping after first iteration.")
+                        self.running = False
+                        if hasattr(self, '_stopped_event') and self._stopped_event and not self._stopped_event.is_set():
+                            self._stopped_event.set()
+                        break
                     if self.config.flow_cycle_delay_ms is not None:
                         rest_duration_s = max(self.config.flow_cycle_delay_ms / 1000.0, 0.001)
                     else:

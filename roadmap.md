@@ -254,7 +254,7 @@ By meticulously addressing these points, the AI agent can successfully upgrade t
 
 ## Project Roadmap
 
-### v1.1.0 (Current)
+### v1.1.3 (Current)
 
 - [x] **Continuous Flow Runner (Simplified):** FlowRunner now runs indefinitely when started via the API and resets context between iterations.
 - [x] **Validation & Error Handling Improvements:** API responses and internal logging provide clearer details on invalid configurations and flow errors.

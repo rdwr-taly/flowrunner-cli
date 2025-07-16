@@ -1,7 +1,7 @@
 
 # FlowRunner (Automated API Flow Execution Engine)
 
-**Version:** 1.1.0
+**Version:** 1.1.3
 **Status:** Stable
 
 ## 1. Overview
@@ -15,7 +15,7 @@ FlowRunner is a powerful, UI-less engine designed for the automated execution of
 
 FlowRunner is designed to execute flows exported from a companion graphical flow authoring application, ensuring consistency between flow design and automated execution.
 
-## 2. Key Features (Version 1.1.0)
+## 2. Key Features (Version 1.1.3)
 
 *   **Flow Execution:**
     *   Runs multi-step API flows defined in a JSON format.
@@ -308,7 +308,7 @@ Defines iteration over a list.
 
 *   Inside the loop `steps`, `{{loopVariable}}` (e.g., `{{item}}`) and `{{loopVariable_index}}` will be available in the context.
 
-### 5.3. URL Construction Logic (Version 1.1.0 Behavior)
+### 5.3. URL Construction Logic (Version 1.1.3 Behavior)
 
 The final URL for each Request step depends on `override_step_url_host`:
 
@@ -322,7 +322,7 @@ The final URL for each Request step depends on `override_step_url_host`:
     *   If it is relative, it is appended to `flow_target_url`.
 4.  **DNS Override:** When `flow_target_dns_override` is set, requests are directed to that IP while the `Host` header reflects the original hostname.
 
-**URL Override Update (v1.1.0):** `config.override_step_url_host` now controls how final request URLs are built. When `true` (default) the scheme/host/port come exclusively from `flow_target_url` and the step only provides the path/query. Set to `false` to allow absolute step URLs as in v1.0.0.
+**URL Override Update (v1.1.3):** `config.override_step_url_host` now controls how final request URLs are built. When `true` (default) the scheme/host/port come exclusively from `flow_target_url` and the step only provides the path/query. Set to `false` to allow absolute step URLs as in v1.0.0.
 
 ## 6. Deployment & Usage (Docker)
 
@@ -330,11 +330,11 @@ Refer to the provided `Dockerfile` and `requirements.txt`.
 
 1.  **Build the Docker Image:**
     ```bash
-    docker build -t flowrunner-engine:1.1.0 .
+    docker build -t flowrunner-engine:1.1.3 .
     ```
 2.  **Run the Container:**
     ```bash
-    docker run -d -p 8080:8080 --name my-flowrunner flowrunner-engine:1.1.0
+    docker run -d -p 8080:8080 --name my-flowrunner flowrunner-engine:1.1.3
     ```
     *   The API will be available on `http://localhost:8080`.
     *   Consider volume mounting for persistent configurations or logs if needed.
@@ -351,10 +351,14 @@ Refer to the provided `Dockerfile` and `requirements.txt`.
 For quick local debugging of `flow_runner.py` without Docker, use the provided `run_local_flow.sh` script:
 
 ```bash
-./run_local_flow.sh path/to/flow.json [target_url] [sim_users] [DEBUG|INFO] [cycle_delay_ms]
+./run_local_flow.sh path/to/flow.json [target_url] [sim_users] [DEBUG|INFO] [cycle_delay_ms] [--min-step-ms N] [--max-step-ms N] [--run-once]
 ```
 
-This executes the flow directly with a local Python interpreter. Pass `cycle_delay_ms` to set a fixed delay between flow iterations (equivalent to the `--cycle-delay-ms` flag). Stop with `Ctrl+C` when finished.
+This executes the flow directly with a local Python interpreter. Optional flags allow fine-grained control:
+- `--cycle-delay-ms` sets a fixed delay between flow iterations.
+- `--min-step-ms`/`--max-step-ms` override the standard min/max step delay.
+- `--run-once` runs the flow a single time and then exits.
+Stop with `Ctrl+C` when finished.
 
 ## 8. Logging
 
