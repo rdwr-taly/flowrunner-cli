@@ -622,7 +622,7 @@ class FlowRunner:
             {"Accept": "application/vnd.api+json", "Connection": "keep-alive", "Authorization": "Bearer random_api_token", "X-API-Version": "2.0", "Accept-Encoding": "gzip, deflate, br"},
             {"Accept": "application/ld+json", "Connection": "keep-alive", "X-Correlation-ID": "some_correlation_id", "Content-Type": "application/json", "Accept-Encoding": "gzip, deflate"},
             {"Accept": "text/csv", "Connection": "keep-alive", "X-Auth-Token": "some_auth_token", "Accept-Encoding": "gzip, deflate, br", "Content-Type": "text/csv"},
-            {"Accept": "application/x-www-form-urlencoded", "Connection": "keep-alive", "Accept-Encoding": "gzip, deflate", "X-Client-Version": "1.1.0", "Content-Type": "application/x-www-form-urlencoded"},
+            {"Accept": "application/x-www-form-urlencoded", "Connection": "keep-alive", "Accept-Encoding": "gzip, deflate", "X-Client-Version": "1.1.3", "Content-Type": "application/x-www-form-urlencoded"},
             {"Accept": "application/protobuf", "Connection": "keep-alive", "Content-Type": "application/protobuf", "Accept-Encoding": "gzip, deflate"},
             {"Accept": "application/octet-stream", "Connection": "keep-alive", "Content-Type": "application/octet-stream", "Accept-Encoding": "gzip, deflate, br"},
             {"Accept": "application/graphql", "Connection": "keep-alive", "Content-Type": "application/graphql", "Accept-Encoding": "gzip, deflate"},
