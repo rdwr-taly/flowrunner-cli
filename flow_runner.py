@@ -537,6 +537,7 @@ class FlowRunner:
         metrics: Metrics,
         *,
         on_iteration_start: Optional[Callable[[int, Dict[str, Any]], Any]] = None,
+        run_once: bool = False,
     ):
         self.config = config
         self.flowmap = flowmap # This should be the validated Pydantic model instance
@@ -548,6 +549,7 @@ class FlowRunner:
         self._active_users_count = 0
         self.lock = asyncio.Lock()  # Lock for managing user_tasks and _active_users_count
         self.on_iteration_start = on_iteration_start
+        self.run_once = run_once
 
         self.configure_logging(self.config.debug)
 
@@ -2142,6 +2144,12 @@ class FlowRunner:
 
                 # --- Inter-Flow Rest Period ---
                 if self.running:
+                    if self.run_once:
+                        logger.info(f"{user_log_prefix}: run_once enabled - stopping after first iteration.")
+                        self.running = False
+                        if hasattr(self, '_stopped_event') and self._stopped_event and not self._stopped_event.is_set():
+                            self._stopped_event.set()
+                        break
                     if self.config.flow_cycle_delay_ms is not None:
                         rest_duration_s = max(self.config.flow_cycle_delay_ms / 1000.0, 0.001)
                     else:

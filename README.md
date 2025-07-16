@@ -351,10 +351,14 @@ Refer to the provided `Dockerfile` and `requirements.txt`.
 For quick local debugging of `flow_runner.py` without Docker, use the provided `run_local_flow.sh` script:
 
 ```bash
-./run_local_flow.sh path/to/flow.json [target_url] [sim_users] [DEBUG|INFO] [cycle_delay_ms]
+./run_local_flow.sh path/to/flow.json [target_url] [sim_users] [DEBUG|INFO] [cycle_delay_ms] [--min-step-ms N] [--max-step-ms N] [--run-once]
 ```
 
-This executes the flow directly with a local Python interpreter. Pass `cycle_delay_ms` to set a fixed delay between flow iterations (equivalent to the `--cycle-delay-ms` flag). Stop with `Ctrl+C` when finished.
+This executes the flow directly with a local Python interpreter. Optional flags allow fine-grained control:
+- `--cycle-delay-ms` sets a fixed delay between flow iterations.
+- `--min-step-ms`/`--max-step-ms` override the standard min/max step delay.
+- `--run-once` runs the flow a single time and then exits.
+Stop with `Ctrl+C` when finished.
 
 ## 8. Logging
 
