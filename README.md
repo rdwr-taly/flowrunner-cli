@@ -53,7 +53,7 @@ The FlowRunner system consists of two main Python files typically run within a D
 2.  **`container_control.py`:**
     *   Provides a FastAPI-based HTTP API to manage and interact with the `FlowRunner` instance.
     *   Endpoints:
-        *   `/api/start`: To initiate flow execution with a given configuration and flowmap.
+        *   `/api/start`: To initiate flow execution with a given configuration and flowmap or flowmaps.
         *   `/api/stop`: To immediately halt any ongoing flow execution.
         *   `/api/health`: Basic health check.
         *   `/api/metrics`: Detailed operational metrics in JSON format.
@@ -66,7 +66,7 @@ All endpoints are prefixed with `/api` unless otherwise noted.
 
 ### 4.1. `POST /api/start`
 
-Starts (or restarts) the FlowRunner with the provided configuration and flowmap. If a flow is already running, it will be forcibly stopped before the new one begins.
+Starts (or restarts) the FlowRunner with the provided configuration and flowmap(s). If a flow is already running, it will be forcibly stopped before the new one begins.
 
 **Request Body (JSON):**
 
@@ -88,8 +88,13 @@ Starts (or restarts) the FlowRunner with the provided configuration and flowmap.
     // Any other fields defined in ContainerConfig Pydantic model
   },
   "flowmap": {
-    // JSON object representing the flow definition. See Section 5 for FlowMap structure.
+    // JSON object representing a single flow definition
   }
+  // or
+  "flowmaps": [
+    { /* first flow */ },
+    { /* second flow */ }
+  ]
 }
 ```
 

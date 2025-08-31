@@ -44,6 +44,7 @@ import pytest
 import logging
 import aiohttp
 import copy
+from pydantic import ValidationError
 
 from flow_runner import (
     FlowRunner,
@@ -54,6 +55,7 @@ from flow_runner import (
     ConditionStep,
     ConditionData,
     Metrics,
+    StartRequest,
     get_value_from_context, _MISSING, set_value_in_context,
 )
 
@@ -80,6 +82,16 @@ def make_runner(config: ContainerConfig, flow: FlowMap) -> FlowRunner:
 def test_flowmap_accepts_numeric_id():
     fm = FlowMap(id=12345, name="test", steps=[], staticVars={})
     assert fm.id == 12345
+
+
+def test_start_request_with_flowmaps(base_config, empty_flow):
+    sr = StartRequest(config=base_config, flowmaps=[empty_flow])
+    assert sr.flowmaps is not None and sr.flowmap is None
+
+
+def test_start_request_requires_flow(base_config):
+    with pytest.raises(ValidationError):
+        StartRequest(config=base_config)
 
 
 def test_init_override_step_url_host_default(base_config, empty_flow):
