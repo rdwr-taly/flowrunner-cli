@@ -224,7 +224,16 @@ class ContainerConfig(BaseModel):
 
 class StartRequest(BaseModel):
     config: ContainerConfig
-    flowmap: FlowMap
+    flowmap: Optional[FlowMap] = None
+    flowmaps: Optional[List[FlowMap]] = None
+
+    @model_validator(mode="after")
+    def check_flowmaps(cls, values: "StartRequest") -> "StartRequest":
+        if not values.flowmap and not values.flowmaps:
+            raise ValueError("Either 'flowmap' or 'flowmaps' must be provided")
+        if values.flowmap and values.flowmaps:
+            raise ValueError("Provide only one of 'flowmap' or 'flowmaps'")
+        return values
 
 # ---------------------------
 # Metrics Tracking
@@ -533,14 +542,16 @@ class FlowRunner:
     def __init__(
         self,
         config: ContainerConfig,
-        flowmap: FlowMap,
+        flowmap: Optional[FlowMap],
         metrics: Metrics,
         *,
+        flowmaps: Optional[List[FlowMap]] = None,
         on_iteration_start: Optional[Callable[[int, Dict[str, Any]], Any]] = None,
         run_once: bool = False,
     ):
         self.config = config
-        self.flowmap = flowmap # This should be the validated Pydantic model instance
+        self.flowmaps = flowmaps or ([flowmap] if flowmap else [])
+        self.flowmap = self.flowmaps[0] if self.flowmaps else None
         self.metrics = metrics
         self.running = False # Indicates if the generator should actively run flows
         self.user_tasks: List[asyncio.Task] = []
@@ -654,9 +665,12 @@ class FlowRunner:
         self.target_ip = self.config.flow_target_dns_override # Already validated by Pydantic
 
         logger.info(f"Flow Runner Initialized: Target='{self.config.flow_target_url}', Target Sim Users={self.config.sim_users}, DNS Override={self.target_ip or 'None'}, Debug={self.config.debug}")
-        flow_name = getattr(self.flowmap, 'name', 'N/A')
-        num_steps = len(self.flowmap.steps) if self.flowmap and self.flowmap.steps else 0
-        logger.info(f"Flow Loaded: {flow_name} ({num_steps} top-level steps)")
+        if len(self.flowmaps) == 1:
+            flow_name = getattr(self.flowmap, 'name', 'N/A')
+            num_steps = len(self.flowmap.steps) if self.flowmap and self.flowmap.steps else 0
+            logger.info(f"Flow Loaded: {flow_name} ({num_steps} top-level steps)")
+        else:
+            logger.info(f"{len(self.flowmaps)} flowmaps loaded")
 
     def configure_logging(self, debug: bool):
         """Configures the logger level based on the debug flag."""
@@ -2011,145 +2025,101 @@ class FlowRunner:
 
 
     async def simulate_user_lifecycle(self, user_id: int):
-        """
-        Manages the continuous lifecycle of a single simulated user task.
-        Includes setup, flow execution loop, rest periods, and cleanup.
-        """
+        """Execute each flowmap exactly once for a single simulated user."""
         user_log_prefix = f"User {user_id}"
-        connector = None # Initialize connector reference
-        flow_iteration = 0
+        connector = None
 
-        try: # Top-level try/finally for reliable active user count decrement
-            # --- Task Startup ---
-            async with self.lock: # Protect counter increment
+        try:
+            async with self.lock:
                 self._active_users_count += 1
-            flow_name_log = getattr(self.flowmap, 'name', 'N/A')
-            logger.info(f"{user_log_prefix}: Task started for flow '{flow_name_log}'. Active users: {self._active_users_count}")
+            logger.info(f"{user_log_prefix}: Task started for {len(self.flowmaps)} flow(s). Active users: {self._active_users_count}")
 
-            # Create connector once for the lifetime of this user task (allows connection pooling)
             connector = self.create_aiohttp_connector()
 
-            # --- Main Loop ---
-            while self.running:
-                flow_iteration += 1
-                flow_instance_start_time = time.monotonic()
-                flow_epoch_start_time = time.time()  # Wall clock time
+            flows = list(self.flowmaps)
+            random.shuffle(flows)
 
-                # --- Generate Per-Flow State ---
+            for flow_iteration, flow in enumerate(flows, start=1):
+                if not self.running:
+                    break
+                flow_instance_start_time = time.monotonic()
+                flow_epoch_start_time = time.time()
+
                 fake_ip = self.generate_random_ip()
                 is_web_like = random.choice([True, False])
-                # Ensure random.choice returns a dict before calling .copy()
                 chosen_headers_template = random.choice(self.headers_web_options if is_web_like else self.headers_api_options)
                 if not isinstance(chosen_headers_template, dict):
-                    logger.error(f"{user_log_prefix} (Iter {flow_iteration}): Invalid header template found: {chosen_headers_template}. Using empty headers.")
+                    logger.error(f"{user_log_prefix} (Flow {flow_iteration}): Invalid header template found: {chosen_headers_template}. Using empty headers.")
                     base_session_headers = {}
                 else:
                     base_session_headers = chosen_headers_template.copy()
 
-                chosen_ua_template = random.choice(self.user_agents_web if is_web_like else self.user_agents_api)
-                if not isinstance(chosen_ua_template, str):
-                     logger.error(f"{user_log_prefix} (Iter {flow_iteration}): Invalid user agent template found: {chosen_ua_template}. Using default UA.")
-                     ua = "FlowRunner/1.0" # Default fallback UA
-                else:
-                     ua = chosen_ua_template
+                ua_template = random.choice(self.user_agents_web if is_web_like else self.user_agents_api)
+                ua = ua_template if isinstance(ua_template, str) else "FlowRunner/1.0"
                 base_session_headers["User-Agent"] = ua
-
                 if self.config.xff_header_name:
                     base_session_headers[self.config.xff_header_name] = fake_ip
-                logger.debug(f"{user_log_prefix} (Iter {flow_iteration}): New session state (IP: {fake_ip}, UA: {ua[:30]}..., Profile: {'Web' if is_web_like else 'API'})")
+                logger.debug(f"{user_log_prefix} (Flow {flow_iteration}): New session state (IP: {fake_ip}, UA: {ua[:30]}..., Profile: {'Web' if is_web_like else 'API'})")
 
-                # --- Initialize Context for this Flow Instance ---
                 context = {
                     "userId": user_id,
                     "userFakeIp": fake_ip,
                     "flowInstance": flow_iteration,
                     "flowStartTimeEpoch": flow_epoch_start_time,
-                    "flow_error": None # Initialize error state explicitly
+                    "flow_error": None,
                 }
-                # Add static variables (use deepcopy for isolation)
-                static_vars = getattr(self.flowmap, 'staticVars', {})
+                static_vars = getattr(flow, 'staticVars', {})
                 if static_vars:
-                    try: context.update(copy.deepcopy(static_vars))
-                    except Exception as copy_err:
-                         logger.warning(f"{user_log_prefix} (Iter {flow_iteration}): Could not deepcopy staticVars: {copy_err}. Using shallow copy.")
-                         context.update(static_vars)
-
-                # Get global flow headers definition (unsubstituted)
-                global_flow_headers_def = getattr(self.flowmap, 'headers', {}) or {}
-
-                if self.on_iteration_start and flow_iteration > 1:
-                    logger.debug(
-                        f"Calling on_iteration_start callback for iteration {flow_iteration} with context keys: {list(context.keys())}"
-                    )
                     try:
-                        self.on_iteration_start(flow_iteration, context)
-                    except Exception as cb_err:
-                        logger.error(
-                            f"Error during on_iteration_start callback for iteration {flow_iteration}: {cb_err}"
-                        )
+                        context.update(copy.deepcopy(static_vars))
+                    except Exception as copy_err:
+                        logger.warning(f"{user_log_prefix} (Flow {flow_iteration}): Could not deepcopy staticVars: {copy_err}. Using shallow copy.")
+                        context.update(static_vars)
 
-                # --- Execute Flow within a Session ---
+                global_flow_headers_def = getattr(flow, 'headers', {}) or {}
+
                 session = None
-                flow_completed_successfully = False # Track if flow finished without internal errors
-                try: # Ensure session is always closed after one flow iteration
+                flow_completed_successfully = False
+                try:
                     session = self.create_session(connector)
-                    logger.info(f"{user_log_prefix} (Iter {flow_iteration}): Starting flow instance.")
+                    flow_name_log = getattr(flow, 'name', 'N/A')
+                    logger.info(f"{user_log_prefix} (Flow {flow_iteration}): Starting flow '{flow_name_log}'.")
 
-                    # Execute the top-level steps (pass the list of models/dicts)
                     await self._execute_steps(
-                        steps=self.flowmap.steps,
+                        steps=flow.steps,
                         session=session,
                         base_headers=base_session_headers,
-                        flow_headers=global_flow_headers_def, # Pass definition, substitution happens inside
+                        flow_headers=global_flow_headers_def,
                         context=context,
-                        depth=0
+                        depth=0,
                     )
 
-                    # Check final error state in context
                     final_flow_error_val = get_value_from_context(context, 'flow_error')
                     if final_flow_error_val is _MISSING or final_flow_error_val is None:
                         flow_completed_successfully = True
                     else:
-                         logger.warning(f"{user_log_prefix} (Iter {flow_iteration}): Flow instance finished with error: {final_flow_error_val}")
-
+                        logger.warning(f"{user_log_prefix} (Flow {flow_iteration}): Flow finished with error: {final_flow_error_val}")
 
                 except asyncio.CancelledError:
-                    logger.info(f"{user_log_prefix} (Iter {flow_iteration}): Flow instance cancelled during execution.")
-                    self.running = False # Ensure loop terminates
-                    # Do not re-raise, let finally close session and outer loop check self.running
+                    logger.info(f"{user_log_prefix} (Flow {flow_iteration}): Flow instance cancelled during execution.")
+                    self.running = False
                 except Exception as e:
-                    logger.error(f"{user_log_prefix} (Iter {flow_iteration}): Unhandled error during flow execution block: {e}", exc_info=self.config.debug)
-                    # Record error state, flow did not complete successfully
+                    logger.error(f"{user_log_prefix} (Flow {flow_iteration}): Unhandled error during flow execution block: {e}", exc_info=self.config.debug)
                     set_value_in_context(context, 'flow_error', f"Unhandled flow error: {e}")
-                    # flow_completed_successfully remains False
-
                 finally:
-                    # --- Cleanup Session for this Iteration ---
                     if session and not session.closed:
                         await session.close()
-                        logger.debug(f"{user_log_prefix} (Iter {flow_iteration}): Session closed.")
+                        logger.debug(f"{user_log_prefix} (Flow {flow_iteration}): Session closed.")
 
-                    # --- Record Metrics and Log Duration ---
                     flow_instance_end_time = time.monotonic()
                     flow_duration = flow_instance_end_time - flow_instance_start_time
-
-                    # Record duration only if flow completed without internal errors and runner is still running
                     if flow_completed_successfully and self.running:
                         await self.metrics.record_flow_duration(flow_duration)
-                        logger.info(f"{user_log_prefix} (Iter {flow_iteration}): Flow instance finished successfully in {flow_duration:.3f} seconds.")
+                        logger.info(f"{user_log_prefix} (Flow {flow_iteration}): Flow finished successfully in {flow_duration:.3f} seconds.")
                     elif not self.running:
-                         logger.info(f"{user_log_prefix} (Iter {flow_iteration}): Flow instance ended (stopped/cancelled) after {flow_duration:.3f} seconds.")
-                    # else: Error already logged
+                        logger.info(f"{user_log_prefix} (Flow {flow_iteration}): Flow ended after {flow_duration:.3f} seconds (stopped/cancelled).")
 
-
-                # --- Inter-Flow Rest Period ---
-                if self.running:
-                    if self.run_once:
-                        logger.info(f"{user_log_prefix}: run_once enabled - stopping after first iteration.")
-                        self.running = False
-                        if hasattr(self, '_stopped_event') and self._stopped_event and not self._stopped_event.is_set():
-                            self._stopped_event.set()
-                        break
+                if self.running and flow_iteration < len(flows):
                     if self.config.flow_cycle_delay_ms is not None:
                         rest_duration_s = max(self.config.flow_cycle_delay_ms / 1000.0, 0.001)
                     else:
@@ -2160,51 +2130,45 @@ class FlowRunner:
                         rest_duration_s = random.uniform(min_rest_s, max_rest_s)
                         if rest_duration_s <= 0.001:
                             rest_duration_s = 0.001
-
-                    logger.info(
-                        f"{user_log_prefix}: Flow iteration {flow_iteration} complete, next in {rest_duration_s:.2f}s"
-                    )
+                    logger.info(f"{user_log_prefix}: Next flow in {rest_duration_s:.2f}s")
                     try:
                         await asyncio.sleep(rest_duration_s)
                     except asyncio.CancelledError:
-                         logger.info(f"{user_log_prefix}: Task cancelled during rest period.")
-                         self.running = False # Ensure loop terminates
-
-            # --- End of Main While Loop (self.running is False or task cancelled) ---
+                        logger.info(f"{user_log_prefix}: Task cancelled during rest period.")
+                        self.running = False
+                        break
 
         except asyncio.CancelledError:
-            # Catch cancellation signal targeting the task itself (e.g., from stop_running)
             logger.info(f"{user_log_prefix}: Task received cancellation signal.")
-            self.running = False # Ensure state consistency
-
+            self.running = False
         except Exception as e:
-             # Catch unexpected errors in the main loop structure or connector setup/cleanup
             logger.critical(f"{user_log_prefix}: Task exiting due to unhandled outer error: {e}", exc_info=True)
-            self.running = False # Ensure state consistency
-
+            self.running = False
         finally:
-            # --- Task Cleanup ---
             logger.info(f"{user_log_prefix}: Task stopping.")
-            # Decrement active user count reliably
-            async with self.lock: # Protect counter decrement
+            async with self.lock:
                 if self._active_users_count > 0:
                     self._active_users_count -= 1
                 else:
                     logger.warning(f"{user_log_prefix}: Task exiting, but active user count was already {self._active_users_count}.")
+                last_user = self._active_users_count == 0
 
-            # --- Cleanup Connector ---
             if connector and not connector.closed:
                 logger.debug(f"{user_log_prefix}: Closing user task connector.")
                 try:
-                    # Use timeout for connector closing to prevent hangs
                     await asyncio.wait_for(connector.close(), timeout=5.0)
                     logger.debug(f"{user_log_prefix}: User task connector closed.")
                 except asyncio.TimeoutError:
-                     logger.warning(f"{user_log_prefix}: Timeout closing user task connector.")
+                    logger.warning(f"{user_log_prefix}: Timeout closing user task connector.")
                 except Exception as conn_close_err:
-                     logger.error(f"{user_log_prefix}: Error closing user task connector: {conn_close_err}")
+                    logger.error(f"{user_log_prefix}: Error closing user task connector: {conn_close_err}")
             elif connector:
-                 logger.debug(f"{user_log_prefix}: Connector was already closed.")
+                logger.debug(f"{user_log_prefix}: Connector was already closed.")
+
+            if last_user:
+                self.running = False
+                if self._stopped_event and not self._stopped_event.is_set():
+                    self._stopped_event.set()
 
             logger.info(f"{user_log_prefix}: Task finished cleanup. Final active users: {self._active_users_count}")
 

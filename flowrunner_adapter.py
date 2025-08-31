@@ -38,20 +38,12 @@ class FlowRunnerAdapter(ApplicationAdapter):
 
     def start(self, start_payload: Dict[str, Any], *, ensure_user) -> Any:
         """
-        Start FlowRunner with the provided configuration and flowmap.
-        
+        Start FlowRunner with the provided configuration and flowmap(s).
+
         Expected payload structure:
         {
-            "config": {
-                "flow_target_url": "http://example.com",
-                "sim_users": 10,
-                "debug": false,
-                ...
-            },
-            "flowmap": {
-                "steps": [...],
-                ...
-            }
+            "config": { ... },
+            "flowmap": { ... } | "flowmaps": [ {...}, {...} ]
         }
         """
         logger.info("Starting FlowRunner with payload")
@@ -202,6 +194,7 @@ class FlowRunnerAdapter(ApplicationAdapter):
             self.flow_runner = FlowRunner(
                 config=start_request.config,
                 flowmap=start_request.flowmap,
+                flowmaps=start_request.flowmaps,
                 metrics=self.metrics
             )
             
