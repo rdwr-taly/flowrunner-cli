@@ -1,0 +1,194 @@
+{
+  "capabilities": {
+    "can_redeploy": true,
+    "can_resume": true,
+    "can_stop": true,
+    "can_update_while_running": false
+  },
+  "category": "Traffic Tools",
+  "containerControl": {
+    "actions": {
+      "start": {
+        "endpoint": "/api/start",
+        "method": "POST",
+        "payload_template": {
+          "config": {
+            "Debug": "{{env.DEBUG_MODE}}",
+            "Flow Cycle Delay MS": "{{env.FLOW_CYCLE_DELAY_MS}}",
+            "Flow Target DNS Override": "{{env.FLOW_TARGET_DNS_OVERRIDE}}",
+            "Flow Target URL": "{{env.FLOW_TARGET_URL}}",
+            "Maximum Step Sleep MS": "{{env.MAX_SLEEP_MS}}",
+            "Minimum Step Sleep MS": "{{env.MIN_SLEEP_MS}}",
+            "Override Step URL Host": "{{env.OVERRIDE_STEP_URL_HOST}}",
+            "Simulated Users": "{{env.SIM_USERS}}",
+            "XFF Header Name": "{{env.XFF_HEADER_NAME}}"
+          },
+          "flowmap": "{{flowmap_json_for_env.FLOWMAP_ID}}"
+        },
+        "payload_template_type": "custom"
+      },
+      "stop": {
+        "endpoint": "/api/stop",
+        "method": "POST"
+      }
+    },
+    "api_port_fixed": 8080,
+    "enabled": true,
+    "metrics_endpoint_path": "/api/metrics"
+  },
+  "deployment": {
+    "container_command_template": [
+      "python",
+      "-m",
+      "uvicorn",
+      "container_control_core:app",
+      "--host",
+      "0.0.0.0",
+      "--port",
+      "8080"
+    ],
+    "default_env_vars": [
+      {
+        "label": "Flow Target URL",
+        "name": "FLOW_TARGET_URL",
+        "required": true,
+        "type": "string"
+      },
+      {
+        "label": "Flow Target DNS Override",
+        "name": "FLOW_TARGET_DNS_OVERRIDE",
+        "type": "string"
+      },
+      {
+        "default_value": "X-Forwarded-For",
+        "label": "XFF Header Name",
+        "name": "XFF_HEADER_NAME",
+        "type": "string"
+      },
+      {
+        "default_value": "10",
+        "label": "Simulated Users",
+        "name": "SIM_USERS",
+        "type": "integer"
+      },
+      {
+        "default_value": "100",
+        "label": "Minimum Step Sleep MS",
+        "name": "MIN_SLEEP_MS",
+        "type": "integer"
+      },
+      {
+        "default_value": "1000",
+        "label": "Maximum Step Sleep MS",
+        "name": "MAX_SLEEP_MS",
+        "type": "integer"
+      },
+      {
+        "label": "Flow Cycle Delay MS",
+        "name": "FLOW_CYCLE_DELAY_MS",
+        "type": "integer"
+      },
+      {
+        "default_value": "true",
+        "label": "Override Step URL Host",
+        "name": "OVERRIDE_STEP_URL_HOST",
+        "type": "boolean"
+      },
+      {
+        "default_value": "false",
+        "label": "Debug",
+        "name": "DEBUG_MODE",
+        "type": "boolean"
+      },
+      {
+        "label": "Select FlowMap",
+        "name": "FLOWMAP_ID",
+        "required": true,
+        "type": "string",
+        "ui_type": "flowmap_select"
+      }
+    ]
+  },
+  "deploymentContext": "app",
+  "description": "Execute multi-step API flows with Container Control v2.0 on a recurring schedule.",
+  "displayName": "Recurrent FlowRunner",
+  "icon": "fas fa-project-diagram",
+  "id": "recurrent-flowrunner-cli",
+  "image": {
+    "repo_tag": "razor29/flowrunner-cli:v1.1.3",
+    "description": ""
+  },
+  "monitoring": {
+    "prometheus": {
+      "enabled": true,
+      "scrape_path": "/metrics",
+      "scrape_port_number": 8080
+    }
+  },
+  "scheduling_fields": {
+    "interval_unit": "hours",
+    "interval_value": 1,
+    "max_concurrent_runs": 1,
+    "overlap_policy": "skip",
+    "type": "interval"
+  },
+  "subCategory": "API Simulation",
+  "taskLifecycle": "recurrent",
+  "ui": {
+    "card_basic_metrics": [
+      {
+        "label": "CPU",
+        "max_value": 100,
+        "source_path": "system.cpu_percent",
+        "unit": "%"
+      },
+      {
+        "label": "Memory",
+        "max_value": 100,
+        "source_path": "system.memory_percent",
+        "unit": "%"
+      }
+    ],
+    "card_info_fields": [
+      {
+        "label": "Target URL",
+        "source_key": "FLOW_TARGET_URL",
+        "source_type": "env_var"
+      }
+    ],
+    "card_primary_metric": {
+      "label": "RPS",
+      "source_path": "flow_runner.rps",
+      "unit": "rps"
+    },
+    "card_secondary_metrics": [
+      {
+        "label": "Active Users",
+        "source_path": "flow_runner.active_users",
+        "unit": ""
+      },
+      {
+        "label": "Avg Flow Duration",
+        "source_path": "flow_runner.avg_flow_duration_ms",
+        "unit": "ms"
+      }
+    ],
+    "deployment_form_sections": [
+      {
+        "fields": [
+          "FLOW_TARGET_URL",
+          "FLOW_TARGET_DNS_OVERRIDE",
+          "XFF_HEADER_NAME",
+          "SIM_USERS",
+          "MIN_SLEEP_MS",
+          "MAX_SLEEP_MS",
+          "FLOW_CYCLE_DELAY_MS",
+          "OVERRIDE_STEP_URL_HOST",
+          "DEBUG_MODE",
+          "FLOWMAP_ID"
+        ],
+        "title": "FlowRunner Settings"
+      }
+    ]
+  }
+}
