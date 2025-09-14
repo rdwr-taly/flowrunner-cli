@@ -243,6 +243,8 @@ class Metrics:
     Tracks RPS using a rolling window and computes average flow duration.
     Thread-safe using asyncio.Lock.
     """
+    MAX_FLOW_COUNT = 10_000
+
     def __init__(self):
         self.lock = asyncio.Lock()
         self.request_timestamps = deque()
@@ -290,6 +292,10 @@ class Metrics:
         async with self.lock:
             self.flow_duration_sum += duration_seconds
             self.flow_count += 1
+            if self.flow_count >= self.MAX_FLOW_COUNT:
+                logger.debug("Resetting flow duration metrics after reaching threshold")
+                self.flow_duration_sum = 0.0
+                self.flow_count = 0
 
     async def get_average_flow_duration_ms(self) -> float:
         """Return the average duration of completed flows in milliseconds."""
