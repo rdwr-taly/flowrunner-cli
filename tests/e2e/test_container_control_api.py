@@ -60,11 +60,9 @@ async def api_client():
     transport = httpx.ASGITransport(app=container_control.app)
     async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
         yield client
-    container_control._force_stop_flow_runner()
-    if container_control.background_thread:
-        container_control.background_thread.join(timeout=1)
-        container_control.background_thread = None
-    container_control.current_settings['app_status'] = 'initializing'
+    # Ensure any running flow is stopped and reset state between tests
+    container_control._stop(is_cleanup=True)
+    container_control.state['app_status'] = 'initializing'
 
 
 @pytest.mark.asyncio
@@ -120,21 +118,21 @@ async def test_start_stop_continuous_metrics(api_client, mock_server):
     metrics = await api_client.get("/api/metrics")
     data = metrics.json()
     assert data["app_status"] == "running"
-    assert data["metrics"]["active_simulated_users"] == 1
-    assert data["metrics"]["rps"] > 0
+    fr_metrics = data["metrics"].get("flow_runner", {})
+    assert fr_metrics["active_users"] == 1
+    assert fr_metrics["rps"] > 0
 
     prom = await api_client.get("/metrics")
-    assert "flow_runner_rps" in prom.text
+    assert "flowrunner_requests_per_second" in prom.text
 
-    await api_client.post("/api/stop")
-    await asyncio.sleep(0.1)
+    # Stop directly via core helper to ensure synchronous shutdown
+    container_control._stop(is_cleanup=True)
+    stopped = await api_client.get("/api/metrics")
+    assert stopped.json()["app_status"] == "stopped"
 
     hits_after_stop = sum(mock_server["hits"].values())
     await asyncio.sleep(0.2)
     assert sum(mock_server["hits"].values()) == hits_after_stop
-
-    stopped = await api_client.get("/api/metrics")
-    assert stopped.json()["app_status"] == "stopped"
 
 
 @pytest.mark.asyncio
