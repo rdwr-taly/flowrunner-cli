@@ -759,3 +759,94 @@ def test_substitute_variables_unquoted_and_malformed(base_config, empty_flow):
         runner._substitute_variables("##VAR:unquoted:name:extra##", context)
         is None
     )
+
+
+@pytest.mark.asyncio
+async def test_simulate_user_lifecycle_moves_to_next_flow_on_failure(base_config):
+    flow1 = FlowMap(name="flow1", steps=[])
+    flow2 = FlowMap(name="flow2", steps=[])
+    metrics = Metrics()
+    metrics.increment = AsyncMock()
+    metrics.record_flow_duration = AsyncMock()
+    runner = FlowRunner(base_config, flow1, metrics, flowmaps=[flow1, flow2])
+    runner.config.min_sleep_ms = runner.config.max_sleep_ms = 0
+    runner.running = True
+
+    class DummyConnector:
+        closed = False
+
+        async def close(self):
+            self.closed = True
+
+    connector = DummyConnector()
+    runner.create_aiohttp_connector = MagicMock(return_value=connector)
+
+    dummy_session = MagicMock()
+    dummy_session.closed = False
+
+    async def close_session():
+        dummy_session.closed = True
+
+    dummy_session.close = AsyncMock(side_effect=close_session)
+    runner.create_session = MagicMock(return_value=dummy_session)
+
+    call_errors = []
+
+    async def fake_execute_steps(steps, session, base_headers, flow_headers, context, depth=0):
+        if not call_errors:
+            set_value_in_context(context, "flow_error", "boom")
+        else:
+            runner.running = False
+        call_errors.append(get_value_from_context(context, "flow_error"))
+
+    runner._execute_steps = AsyncMock(side_effect=fake_execute_steps)
+
+    await runner.simulate_user_lifecycle(user_id=0)
+
+    assert call_errors[0] == "boom"
+    assert call_errors[1] is None
+
+
+@pytest.mark.asyncio
+async def test_simulate_user_lifecycle_restarts_single_flow_after_failure(base_config):
+    flow = FlowMap(name="solo", steps=[])
+    metrics = Metrics()
+    metrics.increment = AsyncMock()
+    metrics.record_flow_duration = AsyncMock()
+    runner = FlowRunner(base_config, flow, metrics)
+    runner.config.min_sleep_ms = runner.config.max_sleep_ms = 0
+    runner.running = True
+
+    class DummyConnector:
+        closed = False
+
+        async def close(self):
+            self.closed = True
+
+    connector = DummyConnector()
+    runner.create_aiohttp_connector = MagicMock(return_value=connector)
+
+    dummy_session = MagicMock()
+    dummy_session.closed = False
+
+    async def close_session():
+        dummy_session.closed = True
+
+    dummy_session.close = AsyncMock(side_effect=close_session)
+    runner.create_session = MagicMock(return_value=dummy_session)
+
+    call_errors = []
+
+    async def fake_execute_steps(steps, session, base_headers, flow_headers, context, depth=0):
+        if not call_errors:
+            set_value_in_context(context, "flow_error", "boom")
+        else:
+            runner.running = False
+        call_errors.append(get_value_from_context(context, "flow_error"))
+
+    runner._execute_steps = AsyncMock(side_effect=fake_execute_steps)
+
+    await runner.simulate_user_lifecycle(user_id=0)
+
+    assert call_errors[0] == "boom"
+    assert call_errors[1] is None
