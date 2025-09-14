@@ -37,7 +37,11 @@ from typing import Annotated
 
 # --- Logging Setup ---
 logger = logging.getLogger("FlowRunner")
-if not logger.hasHandlers():
+# Ensure we don't lose logs if a parent handler exists: only rely on parent
+# handlers when we truly intend to propagate. If we are not going to
+# propagate, we must attach our own handler regardless of parent state.
+added_handler = False
+if not logger.handlers:  # Only check handlers on this logger, not parents
     console_handler = logging.StreamHandler()
     console_handler.setLevel(logging.INFO)
     # Using the "Z" suffix per your second version:
@@ -45,7 +49,11 @@ if not logger.hasHandlers():
     formatter.converter = time.gmtime # Ensure UTC timestamps in formatter
     console_handler.setFormatter(formatter)
     logger.addHandler(console_handler)
-logger.propagate = False # Prevent duplicate logs if root logger is configured
+    added_handler = True
+# If we added our own handler, disable propagation to avoid duplicates.
+# If we did not add a handler (parent handlers exist), keep propagate=True so
+# logs still flow to the root/uvicorn handlers.
+logger.propagate = not added_handler
 
 # --- Exports for flow_container_control ---
 __all__ = [
@@ -278,12 +286,18 @@ class Metrics:
             # Keep snapshot fresh for sync readers (adapter)
             self.last_rps_value = float(len(self.request_timestamps))
             self.last_rps_update_time = now
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    f"[Metrics] increment -> window_size={len(self.request_timestamps)}"
+                )
 
     async def get_rps(self) -> float:
         """Return the approximate RPS over the last 1 second."""
         now = time.monotonic()
         # Cache result briefly to avoid excessive lock contention if called rapidly
         if now - self.last_rps_update_time < 0.1:
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"[Metrics] get_rps (cached) -> rps={self.last_rps_value}")
             return self.last_rps_value
 
         async with self.lock:
@@ -295,6 +309,8 @@ class Metrics:
             current_rps = float(len(self.request_timestamps))
             self.last_rps_value = current_rps
             self.last_rps_update_time = now
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"[Metrics] get_rps -> rps={current_rps}")
             return current_rps
 
     async def record_flow_duration(self, duration_seconds: float):
