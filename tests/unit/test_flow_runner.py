@@ -105,6 +105,17 @@ def test_init_override_step_url_host_false(empty_flow):
     assert runner.config.override_step_url_host is False
 
 
+@pytest.mark.asyncio
+async def test_metrics_resets_after_threshold():
+    metrics = Metrics()
+    metrics.MAX_FLOW_COUNT = 3
+    for _ in range(3):
+        await metrics.record_flow_duration(1.0)
+    assert metrics.flow_count == 0
+    assert metrics.flow_duration_sum == 0.0
+    assert await metrics.get_average_flow_duration_ms() == 0.0
+
+
 def test_get_value_from_context_basic():
     ctx = {"a": {"b": [1, {"c": 2}]}}
     assert get_value_from_context(ctx, "a.b[1].c") == 2
