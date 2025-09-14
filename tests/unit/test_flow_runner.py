@@ -56,7 +56,10 @@ from flow_runner import (
     ConditionData,
     Metrics,
     StartRequest,
-    get_value_from_context, _MISSING, set_value_in_context,
+    get_value_from_context,
+    _MISSING,
+    set_value_in_context,
+    logger as fr_logger,
 )
 
 
@@ -68,6 +71,20 @@ def base_config() -> ContainerConfig:
 @pytest.fixture
 def empty_flow() -> FlowMap:
     return FlowMap(name="test", steps=[], staticVars={"static": "val"})
+
+
+def test_configure_logging_debug(empty_flow):
+    cfg = ContainerConfig(flow_target_url="http://example.com", sim_users=1, debug=True)
+    make_runner(cfg, empty_flow)
+    assert fr_logger.level == logging.DEBUG
+    assert all(h.level == logging.DEBUG for h in fr_logger.handlers)
+
+
+def test_configure_logging_info(empty_flow):
+    cfg = ContainerConfig(flow_target_url="http://example.com", sim_users=1, debug=False)
+    make_runner(cfg, empty_flow)
+    assert fr_logger.level == logging.INFO
+    assert all(h.level == logging.INFO for h in fr_logger.handlers)
 
 
 def make_runner(config: ContainerConfig, flow: FlowMap) -> FlowRunner:
@@ -114,6 +131,17 @@ async def test_metrics_resets_after_threshold():
     assert metrics.flow_count == 0
     assert metrics.flow_duration_sum == 0.0
     assert await metrics.get_average_flow_duration_ms() == 0.0
+
+
+@pytest.mark.asyncio
+async def test_metrics_increment_updates_rps():
+    metrics = Metrics()
+    await metrics.increment()
+    await metrics.increment()
+    assert metrics.last_rps_value >= 1
+    await asyncio.sleep(1.1)
+    await metrics.get_rps()
+    assert metrics.last_rps_value == 0.0
 
 
 def test_get_value_from_context_basic():

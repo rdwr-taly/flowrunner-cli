@@ -268,15 +268,16 @@ class Metrics:
         self.flow_count = 0
 
     async def increment(self):
-        """Record that a request was made (for RPS)."""
+        """Record that a request was made and refresh cached RPS."""
         now = time.monotonic()
         async with self.lock:
             self.request_timestamps.append(now)
-            # Optimization: Only prune when necessary (e.g., during get_rps) or periodically?
-            # For simplicity, prune here.
             one_second_ago = now - 1.0
             while self.request_timestamps and self.request_timestamps[0] < one_second_ago:
                 self.request_timestamps.popleft()
+            # Keep snapshot fresh for sync readers (adapter)
+            self.last_rps_value = float(len(self.request_timestamps))
+            self.last_rps_update_time = now
 
     async def get_rps(self) -> float:
         """Return the approximate RPS over the last 1 second."""
@@ -699,15 +700,13 @@ class FlowRunner:
         else:
             logger.info(f"{len(self.flowmaps)} flowmaps loaded")
 
-    def configure_logging(self, debug: bool):
-        """Configures the logger level based on the debug flag."""
-        log_level = logging.DEBUG if debug else logging.INFO
-        # Configure our specific logger
-        logger.setLevel(log_level)
-        # Also configure handlers attached to our logger
-        for handler in logger.handlers:
-            handler.setLevel(log_level)
-        logger.info(f"Flow Generator logging level set to {logging.getLevelName(log_level)}")
+    def configure_logging(self, debug: bool) -> None:
+        """Configures logger and handler levels based on debug flag."""
+        level = logging.DEBUG if debug else logging.INFO
+        logger.setLevel(level)
+        for h in logger.handlers:
+            h.setLevel(level)
+        logger.debug("Logging configured", extra={"debug": debug})
 
     def create_aiohttp_connector(self) -> aiohttp.BaseConnector:
         """Creates an aiohttp connector, applying DNS override if configured."""
