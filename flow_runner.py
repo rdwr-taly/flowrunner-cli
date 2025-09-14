@@ -187,6 +187,13 @@ class ContainerConfig(BaseModel):
             "If not set, a random delay between min_sleep_ms and max_sleep_ms is used."
         ),
     )
+    allow_flow_concurrency: bool = Field(
+        default=True,
+        description=(
+            "Allow the same flow definition to run concurrently across multiple simulated users. "
+            "If set to False, each flowmap is executed by at most one user at a time."
+        ),
+    )
 
     class Config:
         populate_by_name = True
@@ -199,7 +206,8 @@ class ContainerConfig(BaseModel):
             'max_sleep_ms': 'Maximum Step Sleep MS',
             'debug': 'Debug',
             'override_step_url_host': 'Override Step URL Host',
-            'flow_cycle_delay_ms': 'Flow Cycle Delay MS'
+            'flow_cycle_delay_ms': 'Flow Cycle Delay MS',
+            'allow_flow_concurrency': 'Allow Flow Concurrency'
         }.get(field_name, field_name)
         extra = "allow" # Allow extra fields but ignore them
 
@@ -571,6 +579,9 @@ class FlowRunner:
         self.lock = asyncio.Lock()  # Lock for managing user_tasks and _active_users_count
         self.on_iteration_start = on_iteration_start
         self.run_once = run_once
+
+        # Mapping of flowmap identity to an asyncio.Lock to prevent concurrent execution of the same flow
+        self._flow_locks: Dict[int, asyncio.Lock] = {id(flow): asyncio.Lock() for flow in self.flowmaps}
 
         self.configure_logging(self.config.debug)
 
@@ -2068,10 +2079,18 @@ class FlowRunner:
             while self.running:
                 flows = list(self.flowmaps)
                 random.shuffle(flows)
+                executed_any = False
 
                 for flow_iteration, flow in enumerate(flows, start=1):
                     if not self.running:
                         break
+                    lock = None
+                    if not self.config.allow_flow_concurrency:
+                        lock = self._flow_locks.get(id(flow))
+                        if lock.locked():
+                            continue
+                        await lock.acquire()
+                    executed_any = True
                     overall_flow_iteration += 1
                     flow_instance_start_time = time.monotonic()
                     flow_epoch_start_time = time.time()
@@ -2125,67 +2144,72 @@ class FlowRunner:
                                 f"{user_log_prefix} (Flow {overall_flow_iteration}): on_iteration_start callback error: {cb_err}"
                             )
 
-                global_flow_headers_def = getattr(flow, 'headers', {}) or {}
+                    global_flow_headers_def = getattr(flow, 'headers', {}) or {}
 
-                session = None
-                flow_completed_successfully = False
-                try:
-                    session = self.create_session(connector)
-                    flow_name_log = getattr(flow, 'name', 'N/A')
-                    logger.info(f"{user_log_prefix} (Flow {flow_iteration}): Starting flow '{flow_name_log}'.")
+                    session = None
+                    flow_completed_successfully = False
+                    try:
+                        session = self.create_session(connector)
+                        flow_name_log = getattr(flow, 'name', 'N/A')
+                        logger.info(f"{user_log_prefix} (Flow {flow_iteration}): Starting flow '{flow_name_log}'.")
 
-                    await self._execute_steps(
-                        steps=flow.steps,
-                        session=session,
-                        base_headers=base_session_headers,
-                        flow_headers=global_flow_headers_def,
-                        context=context,
-                        depth=0,
-                    )
+                        await self._execute_steps(
+                            steps=flow.steps,
+                            session=session,
+                            base_headers=base_session_headers,
+                            flow_headers=global_flow_headers_def,
+                            context=context,
+                            depth=0,
+                        )
 
-                    final_flow_error_val = get_value_from_context(context, 'flow_error')
-                    if final_flow_error_val is _MISSING or final_flow_error_val is None:
-                        flow_completed_successfully = True
-                    else:
-                        logger.warning(f"{user_log_prefix} (Flow {flow_iteration}): Flow finished with error: {final_flow_error_val}")
-
-                except asyncio.CancelledError:
-                    logger.info(f"{user_log_prefix} (Flow {flow_iteration}): Flow instance cancelled during execution.")
-                    self.running = False
-                except Exception as e:
-                    logger.error(f"{user_log_prefix} (Flow {flow_iteration}): Unhandled error during flow execution block: {e}", exc_info=self.config.debug)
-                    set_value_in_context(context, 'flow_error', f"Unhandled flow error: {e}")
-                finally:
-                    if session and not session.closed:
-                        await session.close()
-                        logger.debug(f"{user_log_prefix} (Flow {flow_iteration}): Session closed.")
-
-                    flow_instance_end_time = time.monotonic()
-                    flow_duration = flow_instance_end_time - flow_instance_start_time
-                    if flow_completed_successfully and self.running:
-                        await self.metrics.record_flow_duration(flow_duration)
-                        logger.info(f"{user_log_prefix} (Flow {flow_iteration}): Flow finished successfully in {flow_duration:.3f} seconds.")
-                    elif not self.running:
-                        logger.info(f"{user_log_prefix} (Flow {flow_iteration}): Flow ended after {flow_duration:.3f} seconds (stopped/cancelled).")
-
-                    if self.running:
-                        if self.config.flow_cycle_delay_ms is not None:
-                            rest_duration_s = max(self.config.flow_cycle_delay_ms / 1000.0, 0.001)
+                        final_flow_error_val = get_value_from_context(context, 'flow_error')
+                        if final_flow_error_val is _MISSING or final_flow_error_val is None:
+                            flow_completed_successfully = True
                         else:
-                            min_rest_s = self.config.min_sleep_ms / 1000.0
-                            max_rest_s = self.config.max_sleep_ms / 1000.0
-                            if min_rest_s > max_rest_s:
-                                min_rest_s = max_rest_s
-                            rest_duration_s = random.uniform(min_rest_s, max_rest_s)
-                            if rest_duration_s <= 0.001:
-                                rest_duration_s = 0.001
-                        logger.info(f"{user_log_prefix}: Next flow in {rest_duration_s:.2f}s")
-                        try:
-                            await asyncio.sleep(rest_duration_s)
-                        except asyncio.CancelledError:
-                            logger.info(f"{user_log_prefix}: Task cancelled during rest period.")
-                            self.running = False
-                            break
+                            logger.warning(f"{user_log_prefix} (Flow {flow_iteration}): Flow finished with error: {final_flow_error_val}")
+
+                    except asyncio.CancelledError:
+                        logger.info(f"{user_log_prefix} (Flow {flow_iteration}): Flow instance cancelled during execution.")
+                        self.running = False
+                    except Exception as e:
+                        logger.error(f"{user_log_prefix} (Flow {flow_iteration}): Unhandled error during flow execution block: {e}", exc_info=self.config.debug)
+                        set_value_in_context(context, 'flow_error', f"Unhandled flow error: {e}")
+                    finally:
+                        if session and not session.closed:
+                            await session.close()
+                            logger.debug(f"{user_log_prefix} (Flow {flow_iteration}): Session closed.")
+                        if lock is not None and lock.locked():
+                            lock.release()
+
+                        flow_instance_end_time = time.monotonic()
+                        flow_duration = flow_instance_end_time - flow_instance_start_time
+                        if flow_completed_successfully and self.running:
+                            await self.metrics.record_flow_duration(flow_duration)
+                            logger.info(f"{user_log_prefix} (Flow {flow_iteration}): Flow finished successfully in {flow_duration:.3f} seconds.")
+                        elif not self.running:
+                            logger.info(f"{user_log_prefix} (Flow {flow_iteration}): Flow ended after {flow_duration:.3f} seconds (stopped/cancelled).")
+
+                        if self.running:
+                            if self.config.flow_cycle_delay_ms is not None:
+                                rest_duration_s = max(self.config.flow_cycle_delay_ms / 1000.0, 0.001)
+                            else:
+                                min_rest_s = self.config.min_sleep_ms / 1000.0
+                                max_rest_s = self.config.max_sleep_ms / 1000.0
+                                if min_rest_s > max_rest_s:
+                                    min_rest_s = max_rest_s
+                                rest_duration_s = random.uniform(min_rest_s, max_rest_s)
+                                if rest_duration_s <= 0.001:
+                                    rest_duration_s = 0.001
+                            logger.info(f"{user_log_prefix}: Next flow in {rest_duration_s:.2f}s")
+                            try:
+                                await asyncio.sleep(rest_duration_s)
+                            except asyncio.CancelledError:
+                                logger.info(f"{user_log_prefix}: Task cancelled during rest period.")
+                                self.running = False
+                                break
+
+                if not executed_any and self.running:
+                    await asyncio.sleep(0.01)
 
         except asyncio.CancelledError:
             logger.info(f"{user_log_prefix}: Task received cancellation signal.")
