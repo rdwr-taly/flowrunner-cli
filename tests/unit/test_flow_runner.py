@@ -861,3 +861,42 @@ async def test_simulate_user_lifecycle_restarts_single_flow_after_failure(base_c
 
     assert call_errors[0] == "boom"
     assert call_errors[1] is None
+
+
+@pytest.mark.asyncio
+async def test_flow_concurrency_disabled(monkeypatch, empty_flow):
+    cfg = ContainerConfig(
+        flow_target_url="http://example.com",
+        sim_users=2,
+        allow_flow_concurrency=False,
+        min_sleep_ms=0,
+        max_sleep_ms=0,
+    )
+    metrics = Metrics()
+    metrics.increment = AsyncMock()
+    metrics.record_flow_duration = AsyncMock()
+    runner = FlowRunner(cfg, empty_flow, metrics, flowmaps=[empty_flow])
+    runner.running = True
+
+    concurrent = {"count": 0, "max": 0}
+
+    async def fake_execute_steps(*args, **kwargs):
+        concurrent["count"] += 1
+        concurrent["max"] = max(concurrent["max"], concurrent["count"])
+        await asyncio.sleep(0.05)
+        concurrent["count"] -= 1
+
+    monkeypatch.setattr(runner, "_execute_steps", fake_execute_steps)
+    monkeypatch.setattr(runner, "create_aiohttp_connector", lambda: MagicMock(closed=False, close=AsyncMock()))
+    monkeypatch.setattr(runner, "create_session", lambda conn: MagicMock(closed=False, close=AsyncMock()))
+
+    async def stop_later():
+        await asyncio.sleep(0.2)
+        runner.running = False
+
+    task1 = asyncio.create_task(runner.simulate_user_lifecycle(0))
+    task2 = asyncio.create_task(runner.simulate_user_lifecycle(1))
+    stopper = asyncio.create_task(stop_later())
+    await asyncio.gather(task1, task2, stopper)
+
+    assert concurrent["max"] == 1
