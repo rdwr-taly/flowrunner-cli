@@ -583,6 +583,12 @@ class FlowRunner:
         # Mapping of flowmap identity to an asyncio.Lock to prevent concurrent execution of the same flow
         self._flow_locks: Dict[int, asyncio.Lock] = {id(flow): asyncio.Lock() for flow in self.flowmaps}
 
+        # Queue of flows used when concurrency is disallowed. Acts as a stack
+        # (FILO) so the most recently returned flow is executed first.
+        self._available_flows: deque[FlowMap] = deque()
+        self._flow_assignment_lock = asyncio.Lock()
+        self._refresh_available_flows()
+
         self.configure_logging(self.config.debug)
 
         # --- Header/User-Agent Setup (Restored actual lists) ---
@@ -768,6 +774,26 @@ class FlowRunner:
             cookie_jar=None, # Explicitly disable automatic cookie handling per session
             connector_owner=False # Important: Connector is shared and managed outside
         )
+
+    def _refresh_available_flows(self) -> None:
+        """Shuffle and populate the available flow stack."""
+        flows = list(self.flowmaps)
+        random.shuffle(flows)
+        self._available_flows.extend(flows)
+
+    async def _acquire_flow(self) -> Optional[FlowMap]:
+        """Pop the next flow for execution when concurrency is disabled."""
+        while self.running:
+            async with self._flow_assignment_lock:
+                if self._available_flows:
+                    return self._available_flows.pop()
+            await asyncio.sleep(0.01)
+        return None
+
+    async def _release_flow(self, flow: FlowMap) -> None:
+        """Return a flow to the stack after execution."""
+        async with self._flow_assignment_lock:
+            self._available_flows.append(flow)
 
     async def start_generating(self):
         """Start all simulated user tasks and run continuously until stopped."""
@@ -1354,8 +1380,19 @@ class FlowRunner:
                           logger.warning(f"Invalid extraction path '{path_expr}' for variable '{var_name}'. Needs key after 'body.'.")
                           extracted_value = None
                      else:
-                          # Use get_value_from_context on the response body
                           extracted_value = get_value_from_context(response_data, effective_path)
+                elif path_lower.startswith("body["):
+                     source_description = "body"
+                     effective_path = path_expr[len("body"):]
+                     if not effective_path:
+                          logger.warning(f"Invalid extraction path '{path_expr}' for variable '{var_name}'. Needs index after 'body'.")
+                          extracted_value = None
+                     else:
+                          extracted_value = get_value_from_context(response_data, effective_path)
+                elif path_lower.startswith("["):
+                     source_description = "body"
+                     effective_path = path_expr
+                     extracted_value = get_value_from_context(response_data, effective_path)
                 else:
                      # Default: Assume path refers to the response body
                      # This now correctly handles the literal "status" (not ".status") as a body path
@@ -2077,19 +2114,20 @@ class FlowRunner:
 
             overall_flow_iteration = 0
             while self.running:
-                flows = list(self.flowmaps)
-                random.shuffle(flows)
+                if self.config.allow_flow_concurrency:
+                    flows = list(self.flowmaps)
+                    random.shuffle(flows)
+                else:
+                    flow = await self._acquire_flow()
+                    if flow is None:
+                        await asyncio.sleep(0.01)
+                        continue
+                    flows = [flow]
                 executed_any = False
 
                 for flow_iteration, flow in enumerate(flows, start=1):
                     if not self.running:
                         break
-                    lock = None
-                    if not self.config.allow_flow_concurrency:
-                        lock = self._flow_locks.get(id(flow))
-                        if lock.locked():
-                            continue
-                        await lock.acquire()
                     executed_any = True
                     overall_flow_iteration += 1
                     flow_instance_start_time = time.monotonic()
@@ -2178,8 +2216,8 @@ class FlowRunner:
                         if session and not session.closed:
                             await session.close()
                             logger.debug(f"{user_log_prefix} (Flow {flow_iteration}): Session closed.")
-                        if lock is not None and lock.locked():
-                            lock.release()
+                        if not self.config.allow_flow_concurrency:
+                            await self._release_flow(flow)
 
                         flow_instance_end_time = time.monotonic()
                         flow_duration = flow_instance_end_time - flow_instance_start_time
