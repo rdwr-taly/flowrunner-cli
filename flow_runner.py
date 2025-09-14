@@ -2036,45 +2036,66 @@ class FlowRunner:
 
             connector = self.create_aiohttp_connector()
 
-            flows = list(self.flowmaps)
-            random.shuffle(flows)
+            overall_flow_iteration = 0
+            while self.running:
+                flows = list(self.flowmaps)
+                random.shuffle(flows)
 
-            for flow_iteration, flow in enumerate(flows, start=1):
-                if not self.running:
-                    break
-                flow_instance_start_time = time.monotonic()
-                flow_epoch_start_time = time.time()
+                for flow_iteration, flow in enumerate(flows, start=1):
+                    if not self.running:
+                        break
+                    overall_flow_iteration += 1
+                    flow_instance_start_time = time.monotonic()
+                    flow_epoch_start_time = time.time()
 
-                fake_ip = self.generate_random_ip()
-                is_web_like = random.choice([True, False])
-                chosen_headers_template = random.choice(self.headers_web_options if is_web_like else self.headers_api_options)
-                if not isinstance(chosen_headers_template, dict):
-                    logger.error(f"{user_log_prefix} (Flow {flow_iteration}): Invalid header template found: {chosen_headers_template}. Using empty headers.")
-                    base_session_headers = {}
-                else:
-                    base_session_headers = chosen_headers_template.copy()
+                    fake_ip = self.generate_random_ip()
+                    is_web_like = random.choice([True, False])
+                    chosen_headers_template = random.choice(
+                        self.headers_web_options if is_web_like else self.headers_api_options
+                    )
+                    if not isinstance(chosen_headers_template, dict):
+                        logger.error(
+                            f"{user_log_prefix} (Flow {flow_iteration}): Invalid header template found: {chosen_headers_template}. Using empty headers."
+                        )
+                        base_session_headers = {}
+                    else:
+                        base_session_headers = chosen_headers_template.copy()
 
-                ua_template = random.choice(self.user_agents_web if is_web_like else self.user_agents_api)
-                ua = ua_template if isinstance(ua_template, str) else "FlowRunner/1.0"
-                base_session_headers["User-Agent"] = ua
-                if self.config.xff_header_name:
-                    base_session_headers[self.config.xff_header_name] = fake_ip
-                logger.debug(f"{user_log_prefix} (Flow {flow_iteration}): New session state (IP: {fake_ip}, UA: {ua[:30]}..., Profile: {'Web' if is_web_like else 'API'})")
+                    ua_template = random.choice(
+                        self.user_agents_web if is_web_like else self.user_agents_api
+                    )
+                    ua = ua_template if isinstance(ua_template, str) else "FlowRunner/1.0"
+                    base_session_headers["User-Agent"] = ua
+                    if self.config.xff_header_name:
+                        base_session_headers[self.config.xff_header_name] = fake_ip
+                    logger.debug(
+                        f"{user_log_prefix} (Flow {flow_iteration}): New session state (IP: {fake_ip}, UA: {ua[:30]}..., Profile: {'Web' if is_web_like else 'API'})"
+                    )
 
-                context = {
-                    "userId": user_id,
-                    "userFakeIp": fake_ip,
-                    "flowInstance": flow_iteration,
-                    "flowStartTimeEpoch": flow_epoch_start_time,
-                    "flow_error": None,
-                }
-                static_vars = getattr(flow, 'staticVars', {})
-                if static_vars:
-                    try:
-                        context.update(copy.deepcopy(static_vars))
-                    except Exception as copy_err:
-                        logger.warning(f"{user_log_prefix} (Flow {flow_iteration}): Could not deepcopy staticVars: {copy_err}. Using shallow copy.")
-                        context.update(static_vars)
+                    context = {
+                        "userId": user_id,
+                        "userFakeIp": fake_ip,
+                        "flowInstance": overall_flow_iteration,
+                        "flowStartTimeEpoch": flow_epoch_start_time,
+                        "flow_error": None,
+                    }
+                    static_vars = getattr(flow, 'staticVars', {})
+                    if static_vars:
+                        try:
+                            context.update(copy.deepcopy(static_vars))
+                        except Exception as copy_err:
+                            logger.warning(
+                                f"{user_log_prefix} (Flow {flow_iteration}): Could not deepcopy staticVars: {copy_err}. Using shallow copy."
+                            )
+                            context.update(static_vars)
+
+                    if self.on_iteration_start and overall_flow_iteration > 1:
+                        try:
+                            self.on_iteration_start(overall_flow_iteration, context.copy())
+                        except Exception as cb_err:
+                            logger.warning(
+                                f"{user_log_prefix} (Flow {overall_flow_iteration}): on_iteration_start callback error: {cb_err}"
+                            )
 
                 global_flow_headers_def = getattr(flow, 'headers', {}) or {}
 
@@ -2119,24 +2140,24 @@ class FlowRunner:
                     elif not self.running:
                         logger.info(f"{user_log_prefix} (Flow {flow_iteration}): Flow ended after {flow_duration:.3f} seconds (stopped/cancelled).")
 
-                if self.running and flow_iteration < len(flows):
-                    if self.config.flow_cycle_delay_ms is not None:
-                        rest_duration_s = max(self.config.flow_cycle_delay_ms / 1000.0, 0.001)
-                    else:
-                        min_rest_s = self.config.min_sleep_ms / 1000.0
-                        max_rest_s = self.config.max_sleep_ms / 1000.0
-                        if min_rest_s > max_rest_s:
-                            min_rest_s = max_rest_s
-                        rest_duration_s = random.uniform(min_rest_s, max_rest_s)
-                        if rest_duration_s <= 0.001:
-                            rest_duration_s = 0.001
-                    logger.info(f"{user_log_prefix}: Next flow in {rest_duration_s:.2f}s")
-                    try:
-                        await asyncio.sleep(rest_duration_s)
-                    except asyncio.CancelledError:
-                        logger.info(f"{user_log_prefix}: Task cancelled during rest period.")
-                        self.running = False
-                        break
+                    if self.running:
+                        if self.config.flow_cycle_delay_ms is not None:
+                            rest_duration_s = max(self.config.flow_cycle_delay_ms / 1000.0, 0.001)
+                        else:
+                            min_rest_s = self.config.min_sleep_ms / 1000.0
+                            max_rest_s = self.config.max_sleep_ms / 1000.0
+                            if min_rest_s > max_rest_s:
+                                min_rest_s = max_rest_s
+                            rest_duration_s = random.uniform(min_rest_s, max_rest_s)
+                            if rest_duration_s <= 0.001:
+                                rest_duration_s = 0.001
+                        logger.info(f"{user_log_prefix}: Next flow in {rest_duration_s:.2f}s")
+                        try:
+                            await asyncio.sleep(rest_duration_s)
+                        except asyncio.CancelledError:
+                            logger.info(f"{user_log_prefix}: Task cancelled during rest period.")
+                            self.running = False
+                            break
 
         except asyncio.CancelledError:
             logger.info(f"{user_log_prefix}: Task received cancellation signal.")
