@@ -159,6 +159,20 @@ def test_extract_data_non_dict_body(base_config, empty_flow):
     assert ctx["user"] is None
 
 
+def test_extract_data_root_list(base_config, empty_flow):
+    runner = make_runner(base_config, empty_flow)
+    ctx: Dict[str, Any] = {}
+    body = [{"order_id": 1}, {"order_id": 2}]
+    headers = {}
+    rules = {
+        "first": "body.[0].order_id",
+        "second": "body[1].order_id",
+    }
+    runner._extract_data(body, rules, ctx, 200, headers)
+    assert ctx["first"] == 1
+    assert ctx["second"] == 2
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "operator,left,right,expected",
@@ -900,3 +914,48 @@ async def test_flow_concurrency_disabled(monkeypatch, empty_flow):
     await asyncio.gather(task1, task2, stopper)
 
     assert concurrent["max"] == 1
+
+
+@pytest.mark.asyncio
+async def test_flow_distribution_without_concurrency(monkeypatch):
+    flow1 = FlowMap(name="flow1", description=None, headers=None, steps=[], staticVars={"fname": "flow1"})
+    flow2 = FlowMap(name="flow2", description=None, headers=None, steps=[], staticVars={"fname": "flow2"})
+    cfg = ContainerConfig(
+        flow_target_url="http://example.com",
+        sim_users=2,
+        allow_flow_concurrency=False,
+        min_sleep_ms=0,
+        max_sleep_ms=0,
+    )
+    metrics = Metrics()
+    metrics.increment = AsyncMock()
+    metrics.record_flow_duration = AsyncMock()
+    runner = FlowRunner(cfg, flow1, metrics, flowmaps=[flow1, flow2])
+    runner.running = True
+
+    concurrent = {"running": set(), "max": 0, "duplicate": False}
+
+    async def fake_execute_steps(steps, session, base_headers, flow_headers, context, depth=0):
+        fname = context.get("fname")
+        if fname in concurrent["running"]:
+            concurrent["duplicate"] = True
+        concurrent["running"].add(fname)
+        concurrent["max"] = max(concurrent["max"], len(concurrent["running"]))
+        await asyncio.sleep(0.05)
+        concurrent["running"].remove(fname)
+
+    monkeypatch.setattr(runner, "_execute_steps", fake_execute_steps)
+    monkeypatch.setattr(runner, "create_aiohttp_connector", lambda: MagicMock(closed=False, close=AsyncMock()))
+    monkeypatch.setattr(runner, "create_session", lambda conn: MagicMock(closed=False, close=AsyncMock()))
+
+    async def stop_later():
+        await asyncio.sleep(0.2)
+        runner.running = False
+
+    task1 = asyncio.create_task(runner.simulate_user_lifecycle(0))
+    task2 = asyncio.create_task(runner.simulate_user_lifecycle(1))
+    stopper = asyncio.create_task(stop_later())
+    await asyncio.gather(task1, task2, stopper)
+
+    assert not concurrent["duplicate"]
+    assert concurrent["max"] == 2
