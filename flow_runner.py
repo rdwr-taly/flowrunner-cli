@@ -68,6 +68,10 @@ class RequestStep(BaseStep):
     type: Literal['request'] = Field(..., description="Specifies the step type as 'request'")
     method: str = Field(..., description="HTTP method (GET, POST, PUT, etc.)")
     url: str = Field(..., description="URL path (relative to target) or full URL. Can contain {{variables}}.")
+    urlEncode: bool = Field(
+        True,
+        description="Whether to URL-encode variable substitutions in ``url``. Disable if values are pre-encoded.",
+    )
     headers: Optional[Dict[str, str]] = Field(default_factory=dict, description="Headers specific to this request. Can contain {{variables}}.")
     body: Optional[Union[Dict[str, Any], str]] = Field(None, description="Request body (JSON object or raw string). Can contain {{variables}}.")
     extract: Optional[Dict[str, str]] = Field(default_factory=dict, description="Mapping of variable names to extract from response using path notation (e.g., 'token': 'body.data.sessionToken', 'firstId': 'body.data.items[0].id', 'status_code': '.status', 'header_val': 'headers.Content-Type')") # Updated description with prefixes
@@ -888,11 +892,20 @@ class FlowRunner:
         # but currently only accessed internally or via control thread which should be safe enough.
         return self._active_users_count
 
-    def _substitute_variables(self, data: Union[str, Dict, List], context: Dict[str, Any]) -> Union[str, Dict, List, Any]:
+    def _substitute_variables(
+        self,
+        data: Union[str, Dict, List],
+        context: Dict[str, Any],
+        for_url: bool = False,
+    ) -> Union[str, Dict, List, Any]:
         """
         Recursively substitutes variables in strings, dict keys/values, or list items.
         Handles {{varName.or[0].path}}, ##VAR:string:varName##, and ##VAR:unquoted:varName## formats.
         Uses the updated get_value_from_context which handles complex paths and returns _MISSING sentinel.
+
+        If ``for_url`` is True, substituted values that do not appear to be full URLs
+        or hostnames are URL-encoded so special characters (e.g. ``&``) are preserved
+        when placed inside query parameters.
         """
         if isinstance(data, str):
             # Special Token Substitution (##VAR:##) - Primarily for body construction
@@ -962,6 +975,14 @@ class FlowRunner:
                     else:
                          value_str = str(value) # Convert other types to string
 
+                    if for_url:
+                        # Avoid encoding full URLs or plain hostnames with optional ports
+                        if not (
+                            '://' in value_str
+                            or re.fullmatch(r"[A-Za-z0-9\.-]+(:\d+)?", value_str)
+                        ):
+                            value_str = quote(value_str, safe='')
+
                     # Append the substituted value string
                     result_parts.append(value_str)
                     last_end = end
@@ -990,12 +1011,13 @@ class FlowRunner:
             # Note: Substituting keys might have unintended consequences if keys become non-strings.
             # Let's assume keys remain strings after substitution for simplicity.
             return {
-                self._substitute_variables(key, context): self._substitute_variables(val, context)
+                self._substitute_variables(key, context, for_url=for_url):
+                self._substitute_variables(val, context, for_url=for_url)
                 for key, val in data.items()
             }
         elif isinstance(data, list):
             # Recursively substitute in list items
-            return [self._substitute_variables(item, context) for item in data]
+            return [self._substitute_variables(item, context, for_url=for_url) for item in data]
         else:
             # Return non-substitutable types as is (int, float, bool, None, etc.)
             return data
@@ -1374,7 +1396,7 @@ class FlowRunner:
             method = step.method
             # Substitute variables in URL path, step-specific headers, and body
             # Global flow headers are assumed to be already substituted by _execute_steps
-            url_path_substituted = self._substitute_variables(step.url, context)
+            url_path_substituted = self._substitute_variables(step.url, context, for_url=step.urlEncode)
             step_headers_substituted = self._substitute_variables(step.headers or {}, context)
             step_body_substituted = self._substitute_variables(step.body, context) # Handles ##VAR tokens
 
