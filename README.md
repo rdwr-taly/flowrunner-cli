@@ -29,6 +29,7 @@ FlowRunner is designed to execute flows exported from a companion graphical flow
     *   **DNS Override:** Optionally override DNS resolution for the global target URL.
     *   **Override Step URL Host:** By default the host of every request comes from `flow_target_url`, with the step providing only path/query. Disable with `override_step_url_host: false`.
     *   **Flow Cycle Delay:** Optionally specify a fixed wait time between flow iterations via `flow_cycle_delay_ms`.
+    *   **URL Encoding:** Variable substitutions in step URLs are URL‑encoded by default to preserve special characters. Set `urlEncode: false` on a request step to skip encoding.
 *   **Context Management:**
     *   Maintains an execution context that evolves as the flow progresses.
     *   Ensures context isolation for loop iterations.
