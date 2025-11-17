@@ -270,6 +270,7 @@ class Metrics:
         self.request_timestamps = deque()
         self.last_rps_update_time = 0
         self.last_rps_value = 0.0 # Use float for consistency
+        self.total_requests = 0
 
         # --- For average flow duration ---
         self.flow_duration_sum = 0.0
@@ -283,6 +284,7 @@ class Metrics:
             one_second_ago = now - 1.0
             while self.request_timestamps and self.request_timestamps[0] < one_second_ago:
                 self.request_timestamps.popleft()
+            self.total_requests += 1
             # Keep snapshot fresh for sync readers (adapter)
             self.last_rps_value = float(len(self.request_timestamps))
             self.last_rps_update_time = now

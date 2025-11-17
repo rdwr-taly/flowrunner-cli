@@ -119,18 +119,40 @@ class FlowRunnerAdapter(ApplicationAdapter):
         logger.info("Update requested - FlowRunner does not support live updates")
         return False
 
+    def _compute_rps(self) -> float:
+        """Fetch a fresh RPS value from the FlowRunner event loop."""
+        if not self.metrics:
+            return 0.0
+
+        if self.event_loop and self.event_loop.is_running():
+            try:
+                future = asyncio.run_coroutine_threadsafe(
+                    self.metrics.get_rps(),
+                    self.event_loop,
+                )
+                return float(future.result(timeout=1.0))
+            except Exception as exc:
+                logger.debug(f"Failed to refresh RPS metric: {exc}")
+
+        # Fallback to the cached value if we cannot refresh
+        try:
+            return float(self.metrics.last_rps_value)
+        except Exception:
+            return 0.0
+
     def get_metrics(self) -> Dict[str, Any]:
         """Return current FlowRunner metrics."""
         if not self.metrics:
             return {}
-        
+
         try:
+            rps_value = self._compute_rps()
             # Get metrics synchronously (the metrics methods are not async)
             return {
                 "flow_runner": {
                     "running": self.flow_runner is not None and getattr(self.flow_runner, 'running', False),
-                    "rps": self.metrics.last_rps_value,
-                    "total_requests": len(self.metrics.request_timestamps),
+                    "rps": rps_value,
+                    "total_requests": getattr(self.metrics, "total_requests", len(self.metrics.request_timestamps)),
                     "flow_count": self.metrics.flow_count,
                     "avg_flow_duration_ms": (
                         self.metrics.flow_duration_sum / self.metrics.flow_count * 1000
@@ -149,7 +171,10 @@ class FlowRunnerAdapter(ApplicationAdapter):
         
         if "error" in metrics:
             return []
-        
+
+        rps_value = metrics.get("rps", 0)
+        total_requests = metrics.get("total_requests", 0)
+
         lines = []
         
         # Add Prometheus metrics
@@ -159,11 +184,11 @@ class FlowRunnerAdapter(ApplicationAdapter):
         
         lines.append("# HELP flowrunner_requests_per_second Current requests per second")
         lines.append("# TYPE flowrunner_requests_per_second gauge")
-        lines.append(f"flowrunner_requests_per_second {metrics.get('rps', 0)}")
+        lines.append(f"flowrunner_requests_per_second {rps_value}")
         
         lines.append("# HELP flowrunner_total_requests_total Total number of requests made")
         lines.append("# TYPE flowrunner_total_requests_total counter")
-        lines.append(f"flowrunner_total_requests_total {metrics.get('total_requests', 0)}")
+        lines.append(f"flowrunner_total_requests_total {total_requests}")
         
         lines.append("# HELP flowrunner_flows_completed_total Total number of flows completed")
         lines.append("# TYPE flowrunner_flows_completed_total counter")
