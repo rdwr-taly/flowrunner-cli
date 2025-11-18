@@ -8,7 +8,18 @@
 
 FlowRunner is a powerful, UI-less engine designed for the automated execution of API call sequences, known as "flows." It operates within a Docker container and is managed via a simple HTTP API. This component is a core part of the **ShowRunner** orchestration platform, enabling continuous, repeatable execution of complex API interactions for purposes such as:
 
-*   **Automated Legitimate Traffic Generation:** Simulate realistic user and application behavior against target systems.
+*   **Automated Legitimate Traffic Generjq -n --argfile flow ivy.flow.json \
+  '{
+    config: {
+      flow_target_url: "https://bla-secure.ase-team.com",
+      sim_users: 1,
+      override_step_url_host: false
+    },
+    flowmap: $flow
+  }' \
+| curl -X POST http://localhost:8081/api/start \
+    -H "Content-Type: application/json" \
+    -d @-ation:** Simulate realistic user and application behavior against target systems.
 *   **API Health & Endpoint Monitoring:** Continuously verify the availability and correctness of API endpoints.
 *   **API Integration Testing:** Run sequences of API calls to test multi-step processes.
 *   **Security Testing Support:** Execute predefined flows to probe for vulnerabilities or validate security controls under load.
@@ -345,15 +356,14 @@ Refer to the provided `Dockerfile` and `requirements.txt`.
     *   The API will be available on `http://localhost:8080`.
     *   Consider volume mounting for persistent configurations or logs if needed.
 
-3.  **Interact with the API:**
-    *   Use `curl` or any HTTP client (like Postman) to send requests to the `/api/start`, `/api/stop`, etc. endpoints.
-    *   **Example A: send an already-wrapped payload (file contains `{ "config": {...}, "flowmap": {...} }`):**
+3.  **Interact with the API:** Use `curl` or any HTTP client (like Postman) to send requests to `/api/start`, `/api/stop`, etc. Below are runnable `curl`/`jq` examples.
+    *   **Example A: Pre-wrapped payload (file already contains `{config, flowmap}`):**
         ```bash
         curl -X POST -H "Content-Type: application/json" \
           -d @my_flow_request.json \
           http://localhost:8080/api/start
         ```
-    *   **Example B: wrap an existing flow file on the fly (flow file only has the flow definition):**
+    *   **Example B: Wrap a single flow file on the fly (step URLs use host from `flow_target_url`):**
         ```bash
         jq -n --argfile flow my_flow.json '
         {
@@ -365,20 +375,19 @@ Refer to the provided `Dockerfile` and `requirements.txt`.
           flowmap: $flow
         }' | curl -X POST -H "Content-Type: application/json" -d @- http://localhost:8080/api/start
         ```
-    *   **Example C: respect absolute URLs in the flow (do not override host):**
+    *   **Example C: Respect absolute step URLs (do not override host/scheme in the flow):**
         ```bash
         jq -n --argfile flow my_flow.json '
         {
           config: {
             flow_target_url: "https://api.example.com",  # still used for relative URLs
             override_step_url_host: false,
-            sim_users: 2,
-            debug: false
+            sim_users: 2
           },
           flowmap: $flow
         }' | curl -X POST -H "Content-Type: application/json" -d @- http://localhost:8080/api/start
         ```
-    *   **Example D: add extra config knobs (DNS override, delays, debug):**
+    *   **Example D: Add extra config knobs (DNS override, delays, debug):**
         ```bash
         jq -n --argfile flow my_flow.json '
         {
@@ -386,13 +395,26 @@ Refer to the provided `Dockerfile` and `requirements.txt`.
             flow_target_url: "https://api.example.com",
             flow_target_dns_override: "203.0.113.10",
             override_step_url_host: true,
-            sim_users: 2,
+            sim_users: 3,
             min_sleep_ms: 50,
             max_sleep_ms: 150,
             flow_cycle_delay_ms: 500,
             debug: true
           },
           flowmap: $flow
+        }' | curl -X POST -H "Content-Type: application/json" -d @- http://localhost:8080/api/start
+        ```
+    *   **Example E: Multi-flow payload (round-robin when `allow_flow_concurrency=true`):**
+        ```bash
+        jq -n --argfile flowA flow_a.json --argfile flowB flow_b.json '
+        {
+          config: {
+            flow_target_url: "https://api.example.com",
+            sim_users: 4,
+            allow_flow_concurrency: true,
+            override_step_url_host: true
+          },
+          flowmaps: [$flowA, $flowB]
         }' | curl -X POST -H "Content-Type: application/json" -d @- http://localhost:8080/api/start
         ```
 
