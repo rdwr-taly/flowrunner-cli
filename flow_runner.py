@@ -264,13 +264,16 @@ class Metrics:
     Thread-safe using asyncio.Lock.
     """
     MAX_FLOW_COUNT = 10_000
+    MAX_RPS_WINDOW = 100_000  # bound deque growth
+    MAX_TOTAL_REQUESTS = 1_000_000_000  # soft cap to avoid unbounded counter growth
 
     def __init__(self):
         self.lock = asyncio.Lock()
-        self.request_timestamps = deque()
+        self.request_timestamps = deque(maxlen=self.MAX_RPS_WINDOW)
         self.last_rps_update_time = 0
         self.last_rps_value = 0.0 # Use float for consistency
         self.total_requests = 0
+        self._total_requests_resets = 0
 
         # --- For average flow duration ---
         self.flow_duration_sum = 0.0
@@ -284,6 +287,12 @@ class Metrics:
             one_second_ago = now - 1.0
             while self.request_timestamps and self.request_timestamps[0] < one_second_ago:
                 self.request_timestamps.popleft()
+            # Soft-cap the counter to avoid unbounded growth; preserve monotonicity by halving when capped.
+            if self.total_requests >= self.MAX_TOTAL_REQUESTS:
+                self.total_requests //= 2
+                self._total_requests_resets += 1
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(f"[Metrics] total_requests soft-reset to {self.total_requests} (resets={self._total_requests_resets})")
             self.total_requests += 1
             # Keep snapshot fresh for sync readers (adapter)
             self.last_rps_value = float(len(self.request_timestamps))
@@ -1035,7 +1044,23 @@ class FlowRunner:
                             '://' in value_str
                             or re.fullmatch(r"[A-Za-z0-9\.-]+(:\d+)?", value_str)
                         ):
-                            value_str = quote(value_str, safe='')
+                            def _encode_once(candidate: str) -> str:
+                                """
+                                Encode only when needed:
+                                - If already percent-encoded, leave as-is.
+                                - If partially encoded, normalize by decoding then re-encoding once.
+                                - On decode errors, fall back to a single quote() pass.
+                                """
+                                try:
+                                    decoded = unquote(candidate)
+                                    reencoded = quote(decoded, safe='')
+                                    # If decoding/re-encoding yields the same string, it was already properly encoded.
+                                    return candidate if reencoded == candidate else reencoded
+                                except Exception as enc_err:
+                                    logger.debug(f"URL encode fallback for value '{candidate}': {enc_err}")
+                                    return quote(candidate, safe='')
+
+                            value_str = _encode_once(value_str)
 
                     # Append the substituted value string
                     result_parts.append(value_str)

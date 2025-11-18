@@ -202,6 +202,38 @@ def test_extract_data_root_list(base_config, empty_flow):
 
 
 @pytest.mark.asyncio
+async def test_url_substitution_plain_encodes(base_config, empty_flow):
+    runner = make_runner(base_config, empty_flow)
+    context = {"pwd": "p@ss word!"}
+    out = runner._substitute_variables("{{pwd}}", context, for_url=True)
+    assert out == "p%40ss%20word%21"
+
+
+@pytest.mark.asyncio
+async def test_url_substitution_preserves_already_encoded(base_config, empty_flow):
+    runner = make_runner(base_config, empty_flow)
+    context = {"pwd": "p%40ss%21"}
+    out = runner._substitute_variables("{{pwd}}", context, for_url=True)
+    assert out == "p%40ss%21"
+
+
+@pytest.mark.asyncio
+async def test_url_substitution_normalizes_partial_encoding(base_config, empty_flow):
+    runner = make_runner(base_config, empty_flow)
+    context = {"pwd": "p@ss%21word"}
+    out = runner._substitute_variables("{{pwd}}", context, for_url=True)
+    assert out == "p%40ss%21word"
+
+
+@pytest.mark.asyncio
+async def test_url_substitution_handles_malformed_percent(base_config, empty_flow):
+    runner = make_runner(base_config, empty_flow)
+    context = {"pwd": "abc%zz"}
+    out = runner._substitute_variables("{{pwd}}", context, for_url=True)
+    assert out == "abc%25zz"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "operator,left,right,expected",
     [
