@@ -347,9 +347,53 @@ Refer to the provided `Dockerfile` and `requirements.txt`.
 
 3.  **Interact with the API:**
     *   Use `curl` or any HTTP client (like Postman) to send requests to the `/api/start`, `/api/stop`, etc. endpoints.
-    *   Example: Start a flow (assuming `my_flow.json` contains the full request body structure shown in Section 4.1):
+    *   **Example A: send an already-wrapped payload (file contains `{ "config": {...}, "flowmap": {...} }`):**
         ```bash
-        curl -X POST -H "Content-Type: application/json" -d @my_flow.json http://localhost:8080/api/start
+        curl -X POST -H "Content-Type: application/json" \
+          -d @my_flow_request.json \
+          http://localhost:8080/api/start
+        ```
+    *   **Example B: wrap an existing flow file on the fly (flow file only has the flow definition):**
+        ```bash
+        jq -n --argfile flow my_flow.json '
+        {
+          config: {
+            flow_target_url: "https://api.example.com",
+            sim_users: 1,
+            override_step_url_host: true
+          },
+          flowmap: $flow
+        }' | curl -X POST -H "Content-Type: application/json" -d @- http://localhost:8080/api/start
+        ```
+    *   **Example C: respect absolute URLs in the flow (do not override host):**
+        ```bash
+        jq -n --argfile flow my_flow.json '
+        {
+          config: {
+            flow_target_url: "https://api.example.com",  # still used for relative URLs
+            override_step_url_host: false,
+            sim_users: 2,
+            debug: false
+          },
+          flowmap: $flow
+        }' | curl -X POST -H "Content-Type: application/json" -d @- http://localhost:8080/api/start
+        ```
+    *   **Example D: add extra config knobs (DNS override, delays, debug):**
+        ```bash
+        jq -n --argfile flow my_flow.json '
+        {
+          config: {
+            flow_target_url: "https://api.example.com",
+            flow_target_dns_override: "203.0.113.10",
+            override_step_url_host: true,
+            sim_users: 2,
+            min_sleep_ms: 50,
+            max_sleep_ms: 150,
+            flow_cycle_delay_ms: 500,
+            debug: true
+          },
+          flowmap: $flow
+        }' | curl -X POST -H "Content-Type: application/json" -d @- http://localhost:8080/api/start
         ```
 
 ## 7. Local Development / Testing
@@ -396,4 +440,3 @@ Stop with `Ctrl+C` when finished.
 
 *   **Dependencies:** See `requirements.txt`.
 *   **Testing:** A comprehensive test suite should be maintained (details in a separate test plan document).
-
