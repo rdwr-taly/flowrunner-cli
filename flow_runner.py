@@ -202,6 +202,13 @@ class ContainerConfig(BaseModel):
             "If set to False, each flowmap is executed by at most one user at a time."
         ),
     )
+    run_once: bool = Field(
+        default=False,
+        description=(
+            "If true, execute provided flow(s) only once and then stop the runner/container lifecycle. "
+            "Default is continuous operation."
+        ),
+    )
 
     class Config:
         populate_by_name = True
@@ -215,7 +222,8 @@ class ContainerConfig(BaseModel):
             'debug': 'Debug',
             'override_step_url_host': 'Override Step URL Host',
             'flow_cycle_delay_ms': 'Flow Cycle Delay MS',
-            'allow_flow_concurrency': 'Allow Flow Concurrency'
+            'allow_flow_concurrency': 'Allow Flow Concurrency',
+            'run_once': 'Run Once',
         }.get(field_name, field_name)
         extra = "allow" # Allow extra fields but ignore them
 
@@ -593,7 +601,7 @@ class FlowRunner:
         *,
         flowmaps: Optional[List[FlowMap]] = None,
         on_iteration_start: Optional[Callable[[int, Dict[str, Any]], Any]] = None,
-        run_once: bool = False,
+        run_once: Optional[bool] = None,
     ):
         self.config = config
         self.flowmaps = flowmaps or ([flowmap] if flowmap else [])
@@ -606,7 +614,7 @@ class FlowRunner:
         self._active_users_count = 0
         self.lock = asyncio.Lock()  # Lock for managing user_tasks and _active_users_count
         self.on_iteration_start = on_iteration_start
-        self.run_once = run_once
+        self.run_once = run_once if run_once is not None else bool(getattr(self.config, "run_once", False))
 
         # Mapping of flowmap identity to an asyncio.Lock to prevent concurrent execution of the same flow
         self._flow_locks: Dict[int, asyncio.Lock] = {id(flow): asyncio.Lock() for flow in self.flowmaps}
@@ -2287,6 +2295,10 @@ class FlowRunner:
                                 logger.info(f"{user_log_prefix}: Task cancelled during rest period.")
                                 self.running = False
                                 break
+
+                if self.run_once:
+                    logger.info(f"{user_log_prefix}: run_once enabled; stopping after first flow cycle.")
+                    break
 
                 if not executed_any and self.running:
                     await asyncio.sleep(0.01)

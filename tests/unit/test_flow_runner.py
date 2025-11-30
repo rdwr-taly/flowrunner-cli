@@ -571,6 +571,42 @@ async def test_run_stop_continuous(monkeypatch, base_config, empty_flow):
 
 
 @pytest.mark.asyncio
+async def test_simulate_user_lifecycle_run_once(monkeypatch, empty_flow):
+    cfg = ContainerConfig(
+        flow_target_url="http://example.com",
+        sim_users=1,
+        min_sleep_ms=0,
+        max_sleep_ms=0,
+        run_once=True,
+    )
+    metrics = Metrics()
+    metrics.increment = AsyncMock()
+    metrics.record_flow_duration = AsyncMock()
+    runner = FlowRunner(cfg, empty_flow, metrics)
+
+    connector = MagicMock(closed=False, close=AsyncMock())
+    monkeypatch.setattr(runner, "create_aiohttp_connector", lambda: connector)
+
+    session = MagicMock(closed=False, close=AsyncMock())
+    monkeypatch.setattr(runner, "create_session", lambda conn: session)
+
+    contexts = []
+
+    async def fake_execute_steps(steps, session_obj, base_headers=None, flow_headers=None, context=None, depth=0):
+        contexts.append(context.copy())
+
+    monkeypatch.setattr(runner, "_execute_steps", fake_execute_steps)
+    monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+
+    runner.running = True
+    await runner.simulate_user_lifecycle(0)
+
+    assert len(contexts) == 1
+    assert contexts[0].get("flowInstance") == 1
+    assert runner.running is False
+
+
+@pytest.mark.asyncio
 async def test_condition_branch_passes_copied_context(monkeypatch, base_config):
     cond_step = ConditionStep(
         id="c1",
@@ -771,6 +807,15 @@ def test_container_config_alias_flow_cycle_delay_ms():
         **{"Flow Cycle Delay MS": 1500},
     )
     assert cfg.flow_cycle_delay_ms == 1500
+
+
+def test_container_config_alias_run_once():
+    cfg = ContainerConfig(
+        flow_target_url="http://example.com",
+        sim_users=1,
+        **{"Run Once": True},
+    )
+    assert cfg.run_once is True
 
 
 def test_container_config_validation_errors():

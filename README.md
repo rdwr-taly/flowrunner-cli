@@ -48,9 +48,9 @@ FlowRunner is designed to execute flows exported from a companion graphical flow
     *   Randomized source IP injection (via configurable header, e.g., `X-Forwarded-For`).
     *   Rotation of common `User-Agent` strings and other HTTP headers to mimic diverse clients.
 *   **Control API (`container_control.py`):**
-    *   Simple HTTP API for starting, stopping, and monitoring flow execution (always continuous when started).
+    *   Simple HTTP API for starting, stopping, and monitoring flow execution (continuous by default, with an optional run-once toggle).
     *   Endpoints for health checks and detailed metrics (JSON and Prometheus formats).
-*   **Continuous Operation:** Flows automatically repeat until a stop request is issued.
+*   **Continuous Operation:** Flows automatically repeat until a stop request is issued. When the `run_once` flag is provided at start time, the runner completes a single iteration and then shuts down.
 *   **Resource Management:**
     *   Configurable memory limits for the container process to prevent run-away resource consumption.
 
@@ -97,6 +97,7 @@ Starts (or restarts) the FlowRunner with the provided configuration and flowmap(
     "debug": "boolean (default: false, enables verbose logging)"
     "override_step_url_host": "boolean (default: true, ignore host in step URLs)"
     "flow_cycle_delay_ms": "integer (optional, fixed ms wait between flow cycles)"
+    "run_once": "boolean (optional; when true the flow(s) run once, then the runner signals container shutdown)"
     // Any other fields defined in ContainerConfig Pydantic model
   },
   "flowmap": {
@@ -347,11 +348,11 @@ Refer to the provided `Dockerfile` and `requirements.txt`.
 
 1.  **Build the Docker Image:**
     ```bash
-    docker build -t flowrunner-engine:1.1.3 .
+    docker build -t flowrunner-engine:1.1.4 .
     ```
 2.  **Run the Container:**
     ```bash
-    docker run -d -p 8080:8080 --name my-flowrunner flowrunner-engine:1.1.3
+    docker run -d -p 8080:8080 --name my-flowrunner flowrunner-engine:1.1.4
     ```
     *   The API will be available on `http://localhost:8080`.
     *   Consider volume mounting for persistent configurations or logs if needed.

@@ -9,6 +9,8 @@ from __future__ import annotations
 import asyncio
 import threading
 import logging
+import os
+import signal
 from typing import Any, Dict, Optional
 
 from app_adapter import ApplicationAdapter
@@ -35,6 +37,7 @@ class FlowRunnerAdapter(ApplicationAdapter):
         self.background_thread: Optional[threading.Thread] = None
         self.metrics: Optional[Metrics] = None
         self._shutdown_event = threading.Event()
+        self._run_once_completed = False
 
     def start(self, start_payload: Dict[str, Any], *, ensure_user) -> Any:
         """
@@ -52,6 +55,8 @@ class FlowRunnerAdapter(ApplicationAdapter):
         if self.flow_runner or self.background_thread:
             logger.info("Stopping existing FlowRunner instance before starting new one")
             self.stop()
+
+        self._run_once_completed = False
 
         try:
             # Parse and validate the payload
@@ -220,7 +225,7 @@ class FlowRunnerAdapter(ApplicationAdapter):
                 config=start_request.config,
                 flowmap=start_request.flowmap,
                 flowmaps=start_request.flowmaps,
-                metrics=self.metrics
+                metrics=self.metrics,
             )
             
             # Run until shutdown is requested
@@ -248,6 +253,9 @@ class FlowRunnerAdapter(ApplicationAdapter):
                 except Exception as e:
                     logger.warning(f"Error during event loop cleanup: {e}")
             
+            if self._run_once_completed:
+                self._request_process_shutdown()
+
             logger.info("FlowRunner background thread finished")
 
     async def _run_flow_runner_lifecycle(self) -> None:
@@ -257,6 +265,12 @@ class FlowRunnerAdapter(ApplicationAdapter):
         try:
             logger.info("Starting FlowRunner generation")
             await self.flow_runner.start_generating()
+
+            run_once_mode = bool(getattr(self.flow_runner, "run_once", False))
+            if run_once_mode and not self._shutdown_event.is_set():
+                logger.info("FlowRunner completed run-once execution; initiating shutdown.")
+                self._run_once_completed = True
+                self._shutdown_event.set()
             
             # Wait for shutdown signal
             while not self._shutdown_event.is_set():
@@ -272,6 +286,17 @@ class FlowRunnerAdapter(ApplicationAdapter):
                     await self.flow_runner.stop_generating()
                 except Exception as e:
                     logger.warning(f"Error stopping FlowRunner: {e}")
+
+    def _request_process_shutdown(self) -> None:
+        """
+        Request termination of the current process after a run-once execution.
+        Primarily used in container-control scenarios to end the container lifecycle.
+        """
+        try:
+            logger.info("Run-once execution complete; terminating container process.")
+            os.kill(os.getpid(), signal.SIGTERM)
+        except Exception as exc:
+            logger.warning(f"Failed to terminate process after run-once: {exc}")
 
     def pre_start_hooks(self, start_payload: Dict[str, Any]) -> None:
         """Optional hook called before starting FlowRunner."""

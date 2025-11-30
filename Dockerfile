@@ -28,7 +28,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Install additional dependencies for Container Control Core
 RUN pip install --no-cache-dir fastapi uvicorn psutil ruamel.yaml
 
-# Clone Container Control Core v2.0 from GitHub
+# Clone Container Control Core v1.0 from GitHub
 RUN apt-get update && apt-get install -y --no-install-recommends git && \
     git clone --branch v1.0.0 --depth 1 https://github.com/rdwr-taly/container-control.git /tmp/container-control && \
     cp /tmp/container-control/container_control_core.py . && \

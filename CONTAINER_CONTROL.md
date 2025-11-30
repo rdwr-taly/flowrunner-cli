@@ -57,7 +57,8 @@ Content-Type: application/json
     "sim_users": 10,
     "min_sleep_ms": 100,
     "max_sleep_ms": 1000,
-    "debug": false
+    "debug": false,
+    "run_once": false
   },
   "flowmap": {
     "steps": [
@@ -75,6 +76,7 @@ Content-Type: application/json
   }
 }
 ```
+`run_once` is optional. When set to `true`, the flow(s) execute a single iteration and the FlowRunner requests container shutdown once finished. If omitted, FlowRunner runs continuously as before.
 
 ### Stop FlowRunner
 ```http
