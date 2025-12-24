@@ -35,6 +35,7 @@ FlowRunner is designed to execute flows exported from a companion graphical flow
     *   **Static Variables:** Define global key-value pairs for a flow run.
     *   **Dynamic Extraction:** Extract status codes, headers, and body values (including implicit `body.` paths) into variables.
     *   **Substitution:** Use `{{variableName}}` syntax in URLs, headers, and request bodies. `##VAR:string:name##` and `##VAR:unquoted:name##` allow precise JSON value injection.
+    *   **Special Variables:** The `{{RANDOM_IP}}` variable generates a random public IPv4 address once per flow run. The IP remains consistent throughout all steps in a single flow execution cycle, making it ideal for headers like `X-Forwarded-For` or `X-Real-IP`. The IP is regenerated for each new flow cycle.
 *   **URL Handling:**
     *   **Global Target URL:** Configure a primary base URL for all flow operations.
     *   **DNS Override:** Optionally override DNS resolution for the global target URL.
@@ -448,6 +449,34 @@ Stop with `Ctrl+C` when finished.
 *   **Flow Not Behaving as Expected:**
     *   Enable debug logging (`"debug": true` in `/api/start` config) and inspect the detailed logs from `flow_runner.py`.
     *   Check variable substitutions: Are variables resolving to the expected values?
+    *   **{{RANDOM_IP}} Example:** Use the special `{{RANDOM_IP}}` variable to simulate requests from different source IPs:
+        ```json
+        {
+          "name": "IP Rotation Flow",
+          "steps": [
+            {
+              "id": "step1",
+              "type": "request",
+              "method": "GET",
+              "url": "/api/endpoint",
+              "headers": {
+                "X-Forwarded-For": "{{RANDOM_IP}}",
+                "X-Real-IP": "{{RANDOM_IP}}"
+              }
+            },
+            {
+              "id": "step2",
+              "type": "request",
+              "method": "POST",
+              "url": "/api/submit?source={{RANDOM_IP}}",
+              "headers": {
+                "X-Client-IP": "{{RANDOM_IP}}"
+              }
+            }
+          ]
+        }
+        ```
+        In this example, the same random IP is used across all steps in a single flow execution cycle. When the flow repeats (new cycle), a different random IP is generated.
     *   Verify conditional logic: Is the `conditionData` correct and evaluating as intended?
     *   Inspect loop sources: Is the `source` variable resolving to a valid list?
     *   Examine extraction rules: Are paths correct? Are there extraction failure warnings in logs or metrics?

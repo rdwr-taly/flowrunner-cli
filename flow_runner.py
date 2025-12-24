@@ -1034,6 +1034,18 @@ class FlowRunner:
                     # Append the literal text before the match
                     result_parts.append(data[last_end:start])
 
+                    # Handle special reserved variable: RANDOM_IP
+                    if var_path == 'RANDOM_IP':
+                        # Generate random IP once per flow run and cache it in context
+                        if '_RANDOM_IP' not in context:
+                            random_ip = self.generate_random_ip()
+                            context['_RANDOM_IP'] = random_ip
+                            logger.debug(f"Generated random IP for flow run: {random_ip}")
+                        value_str = context['_RANDOM_IP']
+                        result_parts.append(value_str)
+                        last_end = end
+                        continue
+
                     # Get the value from context
                     value = get_value_from_context(context, var_path)
 
