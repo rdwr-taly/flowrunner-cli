@@ -1652,6 +1652,22 @@ class FlowRunner:
             if host_header_override:
                 final_headers['Host'] = host_header_override # Apply Host override if needed
 
+            # Warn if expected XFF-like header is missing or blank after all overrides
+            xff_header_name = (self.config.xff_header_name or "").strip()
+            if xff_header_name:
+                xff_value = None
+                if xff_header_name in final_headers:
+                    xff_value = final_headers.get(xff_header_name)
+                else:
+                    for header_key, header_val in final_headers.items():
+                        if isinstance(header_key, str) and header_key.lower() == xff_header_name.lower():
+                            xff_value = header_val
+                            break
+                if xff_value is None or (isinstance(xff_value, str) and xff_value.strip() == ""):
+                    logger.warning(
+                        f"Step {step_identifier}: Expected header '{xff_header_name}' is missing or empty after merge. "
+                        "Check flow/step headers for overrides or missing substitutions."
+                    )
 
             # --- Prepare Request Body ---
             data_payload = None
