@@ -18,7 +18,7 @@ from pydantic import (
     model_validator,
     ConfigDict,
 )
-from ipaddress import ip_address, AddressValueError
+from ipaddress import ip_address, AddressValueError, ip_network
 from urllib.parse import (
     urlparse,
     urlunparse,
@@ -365,6 +365,29 @@ _context_path_regex = re.compile(r'\[(\d+)\]|([a-zA-Z_]\w*)|\.?([a-zA-Z_]\w*)')
 
 # --- Sentinel Object for Missing Keys ---
 _MISSING = object()
+
+# Extra safety: exclude special-use IPv4 ranges even if an address appears global.
+_SPECIAL_USE_IPV4_NETS = (
+    ip_network("0.0.0.0/8"),
+    ip_network("10.0.0.0/8"),
+    ip_network("100.64.0.0/10"),
+    ip_network("127.0.0.0/8"),
+    ip_network("169.254.0.0/16"),
+    ip_network("172.16.0.0/12"),
+    ip_network("192.0.0.0/24"),
+    ip_network("192.0.2.0/24"),
+    ip_network("192.31.196.0/24"),
+    ip_network("192.52.193.0/24"),
+    ip_network("192.88.99.0/24"),
+    ip_network("192.168.0.0/16"),
+    ip_network("192.175.48.0/24"),
+    ip_network("198.18.0.0/15"),
+    ip_network("198.51.100.0/24"),
+    ip_network("203.0.113.0/24"),
+    ip_network("224.0.0.0/4"),
+    ip_network("240.0.0.0/4"),
+    ip_network("255.255.255.255/32"),
+)
 
 def get_value_from_context(context: Dict[str, Any], key: str) -> Any:
     """
@@ -2367,40 +2390,20 @@ class FlowRunner:
 
 
     def generate_random_ip(self) -> str:
-        """Generates a random, plausible public IPv4 address string, avoiding reserved/special ranges."""
-        # Use existing implementation (seems reasonable)
+        """Generates a random, globally routable public IPv4 address string."""
         while True:
-            octets = [random.randint(1, 223)] + [random.randint(0, 255) for _ in range(3)]
-
-            # Quick checks for common private ranges
-            if octets[0] == 10: continue # 10.0.0.0/8
-            if octets[0] == 127: continue # 127.0.0.0/8 (Loopback)
-            if octets[0] == 172 and 16 <= octets[1] <= 31: continue # 172.16.0.0/12
-            if octets[0] == 192 and octets[1] == 168: continue # 192.168.0.0/16
-
-            # Check other reserved ranges (can be simplified/combined)
-            if octets[0] == 0: continue # 0.0.0.0/8 (Current network)
-            if octets[0] == 100 and 64 <= octets[1] <= 127: continue # 100.64.0.0/10 (Shared Address Space)
-            if octets[0] == 169 and octets[1] == 254: continue # 169.254.0.0/16 (Link-local)
-            if octets[0] == 192 and octets[1] == 0 and octets[2] == 0: continue # 192.0.0.0/24 (IETF Assignment)
-            if octets[0] == 192 and octets[1] == 0 and octets[2] == 2: continue # 192.0.2.0/24 (TEST-NET-1)
-            if octets[0] == 192 and octets[1] == 88 and octets[2] == 99: continue # 192.88.99.0/24 (6to4 Relay)
-            if octets[0] == 198 and 18 <= octets[1] <= 19: continue # 198.18.0.0/15 (Benchmark Testing)
-            if octets[0] == 198 and octets[1] == 51 and octets[2] == 100: continue # 198.51.100.0/24 (TEST-NET-2)
-            if octets[0] == 203 and octets[1] == 0 and octets[2] == 113: continue # 203.0.113.0/24 (TEST-NET-3)
-            # Skip multicast (224.0.0.0 to 239.255.255.255) - covered by first octet < 224
-            # Skip Broadcast (255.255.255.255) - covered by first octet < 224
-
-            ip_str = f"{octets[0]}.{octets[1]}.{octets[2]}.{octets[3]}"
-
-            # Final check using ipaddress module flags (optional belt-and-suspenders)
-            # try:
-            #     addr = ip_address(ip_str)
-            #     if addr.is_private or addr.is_reserved or addr.is_loopback or addr.is_link_local or addr.is_multicast:
-            #         continue # Should be caught by checks above
-            # except ValueError: continue # Should not happen
-
-            return ip_str
+            candidate_int = random.getrandbits(32)
+            try:
+                addr = ip_address(candidate_int)
+            except ValueError:
+                continue
+            if getattr(addr, "version", None) != 4:
+                continue
+            if not addr.is_global:
+                continue
+            if any(addr in net for net in _SPECIAL_USE_IPV4_NETS):
+                continue
+            return str(addr)
 
 
 # --- Final Pydantic Model Rebuild ---
