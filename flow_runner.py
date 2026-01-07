@@ -608,6 +608,41 @@ def set_value_in_context(context: Dict[str, Any], key: str, value: Any):
         logger.error(f"Unexpected error setting context key '{key}' at path '{processed_path}': {e}", exc_info=False)
 
 
+def get_header_value_case_insensitive(headers: Dict[str, Any], header_name: str) -> Optional[Any]:
+    """
+    Return the header value for header_name from headers using case-insensitive lookup.
+    """
+    if not headers or not header_name:
+        return None
+    if header_name in headers:
+        return headers.get(header_name)
+    header_name_lower = header_name.lower()
+    for key, value in headers.items():
+        if isinstance(key, str) and key.lower() == header_name_lower:
+            return value
+    return None
+
+
+def validate_public_ipv4(candidate: str) -> tuple[bool, str]:
+    """
+    Validate candidate as a globally routable IPv4 address (not special-use).
+    Returns (is_valid, reason).
+    """
+    if not candidate:
+        return False, "empty"
+    try:
+        addr = ip_address(candidate)
+    except ValueError:
+        return False, "invalid"
+    if getattr(addr, "version", None) != 4:
+        return False, "not_ipv4"
+    if not addr.is_global:
+        return False, "not_global"
+    if any(addr in net for net in _SPECIAL_USE_IPV4_NETS):
+        return False, "special_use"
+    return True, "ok"
+
+
 # ---------------------------
 # Flow Runner Class
 # ---------------------------
@@ -766,6 +801,25 @@ class FlowRunner:
             h.setLevel(level)
         logger.debug("Logging configured", extra={"debug": debug})
 
+    async def _trace_on_request_start(self, session: aiohttp.ClientSession, trace_config_ctx: Any, params: Any) -> None:
+        """Trace hook to log headers as aiohttp is about to send the request."""
+        try:
+            raw_headers = params.headers or {}
+            log_headers = {
+                k: ("********" if isinstance(k, str) and k.lower() in ("authorization", "cookie") and v else v)
+                for k, v in raw_headers.items()
+            }
+            logger.debug(f"Trace Send -> {params.method} {params.url} Headers: {log_headers}")
+        except Exception as trace_err:
+            logger.debug(f"Trace hook error (request start): {trace_err}")
+
+    async def _trace_on_request_end(self, session: aiohttp.ClientSession, trace_config_ctx: Any, params: Any) -> None:
+        """Trace hook to log request completion details."""
+        try:
+            logger.debug(f"Trace Done -> {params.method} {params.url} Status: {params.response.status}")
+        except Exception as trace_err:
+            logger.debug(f"Trace hook error (request end): {trace_err}")
+
     def create_aiohttp_connector(self) -> aiohttp.BaseConnector:
         """Creates an aiohttp connector, applying DNS override if configured."""
         resolver = None
@@ -823,13 +877,20 @@ class FlowRunner:
             sock_connect=5, # Max time to connect socket (part of connect timeout)
             sock_read=30    # Max time between receiving data chunks
         )
+        trace_configs = []
+        if self.config.debug:
+            trace_config = aiohttp.TraceConfig()
+            trace_config.on_request_start.append(self._trace_on_request_start)
+            trace_config.on_request_end.append(self._trace_on_request_end)
+            trace_configs = [trace_config]
         # Create session WITHOUT cookie jar to ensure user isolation between flow runs
         # Connector lifecycle is managed externally (in simulate_user_lifecycle)
         return aiohttp.ClientSession(
             connector=connector,
             timeout=timeout,
             cookie_jar=None, # Explicitly disable automatic cookie handling per session
-            connector_owner=False # Important: Connector is shared and managed outside
+            connector_owner=False, # Important: Connector is shared and managed outside
+            trace_configs=trace_configs,
         )
 
     def _refresh_available_flows(self) -> None:
@@ -1678,18 +1739,34 @@ class FlowRunner:
             # Warn if expected XFF-like header is missing or blank after all overrides
             xff_header_name = (self.config.xff_header_name or "").strip()
             if xff_header_name:
-                xff_value = None
-                if xff_header_name in final_headers:
-                    xff_value = final_headers.get(xff_header_name)
-                else:
-                    for header_key, header_val in final_headers.items():
-                        if isinstance(header_key, str) and header_key.lower() == xff_header_name.lower():
-                            xff_value = header_val
-                            break
-                if xff_value is None or (isinstance(xff_value, str) and xff_value.strip() == ""):
+                base_xff = get_header_value_case_insensitive(base_headers, xff_header_name)
+                flow_xff = get_header_value_case_insensitive(flow_headers, xff_header_name)
+                step_xff = None
+                if isinstance(step_headers_substituted, dict):
+                    step_xff = get_header_value_case_insensitive(step_headers_substituted, xff_header_name)
+                final_xff = get_header_value_case_insensitive(final_headers, xff_header_name)
+                if self.config.debug:
+                    logger.debug(
+                        f"Step {step_identifier}: XFF header '{xff_header_name}' values -> "
+                        f"base={base_xff!r}, flow={flow_xff!r}, step={step_xff!r}, final={final_xff!r}"
+                    )
+                if final_xff is None or (isinstance(final_xff, str) and final_xff.strip() == ""):
                     logger.warning(
                         f"Step {step_identifier}: Expected header '{xff_header_name}' is missing or empty after merge. "
                         "Check flow/step headers for overrides or missing substitutions."
+                    )
+                elif isinstance(final_xff, str):
+                    candidate = final_xff.split(",")[0].strip()
+                    is_valid, reason = validate_public_ipv4(candidate)
+                    if not is_valid:
+                        logger.warning(
+                            f"Step {step_identifier}: Header '{xff_header_name}' value '{final_xff}' "
+                            f"is not a valid public IPv4 ({reason})."
+                        )
+                else:
+                    logger.warning(
+                        f"Step {step_identifier}: Header '{xff_header_name}' has non-string value "
+                        f"({type(final_xff).__name__})."
                     )
 
             # --- Prepare Request Body ---
