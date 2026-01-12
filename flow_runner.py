@@ -1597,32 +1597,37 @@ class FlowRunner:
         if not filtered_keys:
             return final_headers
 
+        host_key = None
+        connection_key = None
         content_length_key = None
         for key in final_headers.keys():
-            if isinstance(key, str) and key.lower() == "content-length":
+            if not isinstance(key, str):
+                continue
+            key_lower = key.lower()
+            if host_key is None and key_lower == "host":
+                host_key = key
+            elif connection_key is None and key_lower == "connection":
+                connection_key = key
+            elif content_length_key is None and key_lower == "content-length":
                 content_length_key = key
+            if host_key and connection_key and content_length_key:
                 break
 
-        moved_keys = set(filtered_keys)
-        if content_length_key:
-            moved_keys.add(content_length_key)
-
-        base_items = [(k, v) for k, v in final_headers.items() if k not in moved_keys]
-        first_two = base_items[:2]
-        rest = base_items[2:]
-
-        reordered_items = []
-        reordered_items.extend(first_two)
-        if content_length_key:
-            reordered_items.append((content_length_key, final_headers[content_length_key]))
+        ordered_keys: List[str] = []
+        for key in (host_key, connection_key, content_length_key):
+            if key and key in final_headers and key not in ordered_keys:
+                ordered_keys.append(key)
         for key in filtered_keys:
-            reordered_items.append((key, final_headers[key]))
-        reordered_items.extend(rest)
+            if key in final_headers and key not in ordered_keys:
+                ordered_keys.append(key)
+
+        rest_keys = [key for key in final_headers.keys() if key not in ordered_keys]
+        reordered_items = [(key, final_headers[key]) for key in ordered_keys + rest_keys]
 
         if self.config.debug:
-            anchor = "Content-Length" if content_length_key else "first two headers"
             logger.debug(
-                f"Step {step_identifier}: Positioned RANDOM_IP header(s) after {anchor}: {filtered_keys}"
+                f"Step {step_identifier}: Ordered headers (Host -> Connection -> Content-Length -> RANDOM_IP -> rest). "
+                f"RANDOM_IP header(s): {filtered_keys}"
             )
 
         return dict(reordered_items)
