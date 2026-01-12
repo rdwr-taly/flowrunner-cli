@@ -1566,6 +1566,67 @@ class FlowRunner:
                 # Set context variable to None on unexpected error
                 set_value_in_context(context, var_name, None)
 
+    def _reorder_random_ip_headers(
+        self,
+        final_headers: Dict[str, str],
+        flow_headers: Dict[str, str],
+        context: Dict[str, Any],
+        step_identifier: str,
+    ) -> Dict[str, str]:
+        random_ip = context.get("_RANDOM_IP")
+        if not isinstance(random_ip, str) or not random_ip:
+            return final_headers
+        if not final_headers or not flow_headers:
+            return final_headers
+
+        candidate_keys: List[str] = []
+        for key, value in flow_headers.items():
+            if isinstance(key, str) and isinstance(value, str) and random_ip in value:
+                candidate_keys.append(key)
+
+        if not candidate_keys:
+            return final_headers
+
+        filtered_keys: List[str] = []
+        for key in candidate_keys:
+            if key in final_headers:
+                value = final_headers.get(key)
+                if isinstance(value, str) and random_ip in value:
+                    filtered_keys.append(key)
+
+        if not filtered_keys:
+            return final_headers
+
+        content_length_key = None
+        for key in final_headers.keys():
+            if isinstance(key, str) and key.lower() == "content-length":
+                content_length_key = key
+                break
+
+        moved_keys = set(filtered_keys)
+        if content_length_key:
+            moved_keys.add(content_length_key)
+
+        base_items = [(k, v) for k, v in final_headers.items() if k not in moved_keys]
+        first_two = base_items[:2]
+        rest = base_items[2:]
+
+        reordered_items = []
+        reordered_items.extend(first_two)
+        if content_length_key:
+            reordered_items.append((content_length_key, final_headers[content_length_key]))
+        for key in filtered_keys:
+            reordered_items.append((key, final_headers[key]))
+        reordered_items.extend(rest)
+
+        if self.config.debug:
+            anchor = "Content-Length" if content_length_key else "first two headers"
+            logger.debug(
+                f"Step {step_identifier}: Positioned RANDOM_IP header(s) after {anchor}: {filtered_keys}"
+            )
+
+        return dict(reordered_items)
+
 
     async def _execute_request_step(
         self,
@@ -1804,6 +1865,12 @@ class FlowRunner:
                     logger.warning(f"Step {step_identifier}: Unsupported body type after substitution: {type(step_body_substituted)}. Sending as string representation.")
                     data_payload = str(step_body_substituted).encode('utf-8', errors='replace')
 
+            final_headers = self._reorder_random_ip_headers(
+                final_headers,
+                flow_headers,
+                context,
+                step_identifier,
+            )
 
             if logger.isEnabledFor(logging.DEBUG):
                 log_headers = {k: ('********' if isinstance(v, str) and (k.lower() == 'authorization' or k.lower() == 'cookie') and v else v) for k, v in final_headers.items()}
