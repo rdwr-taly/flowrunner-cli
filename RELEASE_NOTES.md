@@ -1,10 +1,10 @@
-# Release Notes: FlowRunner CLI v1.1.3
+# Release Notes: FlowRunner CLI v1.2.0
 
 ## Highlights
 
-- **Container Control Core v2.0 integration** for unified lifecycle management and API endpoints.
-- **Run once and step delay overrides** via updated `run_local_flow.sh` script and direct invoker.
-- **Enhanced release pipeline** with GitHub workflow updates.
-- **Documentation updates** and improved local execution options.
+- **Transform step support** for ordered operations (base64/JWT, JSON set, math, and conversions).
+- **New special variables** `RANDOM_INT` and `RANDOM_STRING` (cached per flow iteration).
+- **Updated flow compatibility** with FlowRunner UI v1.2.0 exports.
+- **Documentation updates** and refreshed Docker image tag.
 
-This release aligns the CLI with the latest Container Control capabilities while giving operators more control when executing flows locally. See the README for detailed usage instructions.
+Use the published image: `razor29/flowrunner-cli:v1.2.0`. See the README for detailed usage instructions.

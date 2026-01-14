@@ -2,6 +2,9 @@
 
 import asyncio
 import aiohttp
+import base64
+import hashlib
+import hmac
 import json
 import random
 import time
@@ -135,17 +138,30 @@ class LoopStep(BaseStep):
     loopVariable: str = Field(..., description="Name for the variable representing each item in the loop (e.g., 'item')")
     steps: List["FlowStep"] = Field(default_factory=list, description="Steps to execute for each item in the loop")
 
+class TransformOp(BaseModel):
+    op: str = Field(..., description="Transform operation name")
+    set: str = Field(..., description="Context variable name to store the result")
+    args: List[Any] = Field(default_factory=list, description="Arguments for the transform operation")
+    options: Dict[str, Any] = Field(default_factory=dict, description="Options for the transform operation")
+
+    model_config = ConfigDict(extra="ignore")
+
+class TransformStep(BaseStep):
+    type: Literal['transform'] = Field(..., description="Specifies the step type as 'transform'")
+    ops: List[TransformOp] = Field(default_factory=list, description="List of transform operations to execute")
+
 # ------------------------------------------------------------------
 # Make FlowStep a discriminated union using Annotated
 # ------------------------------------------------------------------
 FlowStep = Annotated[
-    Union[RequestStep, ConditionStep, LoopStep],
+    Union[RequestStep, ConditionStep, LoopStep, TransformStep],
     Field(discriminator='type')
 ]
 
 # Update nested references in ConditionStep and LoopStep
 ConditionStep.model_rebuild()
 LoopStep.model_rebuild()
+TransformStep.model_rebuild()
 
 class FlowMap(BaseModel):
     id: Optional[str | int] = Field(
@@ -608,6 +624,546 @@ def set_value_in_context(context: Dict[str, Any], key: str, value: Any):
         logger.error(f"Unexpected error setting context key '{key}' at path '{processed_path}': {e}", exc_info=False)
 
 
+# ---------------------------
+# Special Variables & Transform Ops
+# ---------------------------
+
+_RANDOM_INT_DEFAULT_MIN = 0
+_RANDOM_INT_DEFAULT_MAX = 1000000
+_RANDOM_STRING_DEFAULT_LENGTH = 12
+_RANDOM_STRING_MAX_LENGTH = 256
+_RANDOM_STRING_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+
+_TRANSFORM_OP_DEFS: Dict[str, Dict[str, Any]] = {
+    "base64_decode": {"args": 1, "options": {"base64": "url", "as": "text"}},
+    "base64_encode": {"args": 1, "options": {"base64": "url", "padding": "strip"}},
+    "jwt_decode": {"args": 1, "options": {"base64": "url", "stripBearer": "true"}},
+    "jwt_encode": {"args": 3, "options": {"base64": "url", "signatureMode": "reuse", "algorithm": "HS256"}},
+    "json_set": {"args": 3, "options": {}},
+    "math_add": {"args": 2, "options": {}},
+    "math_sub": {"args": 2, "options": {}},
+    "math_mul": {"args": 2, "options": {}},
+    "math_div": {"args": 2, "options": {}},
+    "to_number": {"args": 1, "options": {}},
+    "to_string": {"args": 1, "options": {}},
+    "to_boolean": {"args": 1, "options": {}},
+    "boolean_not": {"args": 1, "options": {}},
+}
+
+
+def _parse_function_args(ref: str, name: str) -> Optional[List[str]]:
+    pattern = re.compile(rf"^{re.escape(name)}\s*(?:\(([^)]*)\))?$")
+    match = pattern.match(ref)
+    if not match:
+        return None
+    args = match.group(1)
+    if not args:
+        return []
+    return [part.strip() for part in args.split(",") if part.strip()]
+
+
+def _parse_int(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return int(text, 10)
+    except ValueError:
+        try:
+            return int(float(text))
+        except (ValueError, TypeError):
+            return None
+
+
+def _generate_random_int(min_value: int, max_value: int) -> int:
+    if max_value < min_value:
+        min_value, max_value = max_value, min_value
+    return random.randint(min_value, max_value)
+
+
+def _generate_random_string(length: int) -> str:
+    safe_length = max(1, min(length, _RANDOM_STRING_MAX_LENGTH))
+    return "".join(random.choice(_RANDOM_STRING_CHARS) for _ in range(safe_length))
+
+
+def _normalize_ref_path(ref_path: str) -> str:
+    if not ref_path or not isinstance(ref_path, str):
+        return ""
+    trimmed = ref_path.strip()
+    if trimmed.startswith("{{") and trimmed.endswith("}}"):
+        return trimmed[2:-2].strip()
+    return trimmed
+
+
+def _normalize_boolean(value: Any, fallback: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lower = value.strip().lower()
+        if lower == "true":
+            return True
+        if lower == "false":
+            return False
+    return fallback
+
+
+def _normalize_transform_op(op: Any) -> Dict[str, Any]:
+    if isinstance(op, TransformOp):
+        safe_op: Dict[str, Any] = op.model_dump()
+    elif isinstance(op, dict):
+        safe_op = op
+    else:
+        safe_op = {}
+
+    op_name = safe_op.get("op")
+    if op_name not in _TRANSFORM_OP_DEFS:
+        op_name = "base64_decode"
+
+    defn = _TRANSFORM_OP_DEFS[op_name]
+    raw_args = safe_op.get("args")
+    args = list(raw_args) if isinstance(raw_args, list) else []
+    args = args[: defn["args"]]
+    while len(args) < defn["args"]:
+        args.append("")
+
+    options: Dict[str, Any] = {}
+    provided_options = safe_op.get("options")
+    if isinstance(provided_options, dict):
+        for key, default in defn["options"].items():
+            if key in provided_options:
+                options[key] = provided_options[key]
+            elif default is not None:
+                options[key] = default
+    else:
+        options = {key: value for key, value in defn["options"].items() if value is not None}
+
+    set_name = safe_op.get("set") if isinstance(safe_op.get("set"), str) else ""
+
+    return {
+        "op": op_name,
+        "set": set_name,
+        "args": args,
+        "options": options,
+    }
+
+
+def _resolve_transform_value(value: Any, context: Dict[str, Any], evaluate_path: Optional[Any]) -> Any:
+    if isinstance(value, dict) and not isinstance(value, TransformOp):
+        keys = list(value.keys())
+        if len(keys) == 1 and keys[0] == "ref":
+            path = _normalize_ref_path(value.get("ref", ""))
+            if not path:
+                raise ValueError("Transform reference is empty.")
+            if not callable(evaluate_path):
+                raise ValueError("Transform reference requires a path evaluator.")
+            resolved = evaluate_path(context, path)
+            if resolved is _MISSING:
+                raise ValueError(f'Transform reference "{{{{{path}}}}}" is undefined.')
+            return resolved
+        resolved_obj: Dict[str, Any] = {}
+        for key, item in value.items():
+            resolved_obj[key] = _resolve_transform_value(item, context, evaluate_path)
+        return resolved_obj
+
+    if isinstance(value, list):
+        return [_resolve_transform_value(item, context, evaluate_path) for item in value]
+
+    if isinstance(value, str):
+        trimmed = value.strip()
+        if trimmed.startswith("{{") and trimmed.endswith("}}"):
+            path = _normalize_ref_path(trimmed)
+            if not path:
+                raise ValueError("Transform reference is empty.")
+            if not callable(evaluate_path):
+                raise ValueError("Transform reference requires a path evaluator.")
+            resolved = evaluate_path(context, path)
+            if resolved is _MISSING:
+                raise ValueError(f'Transform reference "{{{{{path}}}}}" is undefined.')
+            return resolved
+    return value
+
+
+def _normalize_base64_variant(value: Any, fallback: str) -> str:
+    return value if value in ("standard", "url") else fallback
+
+
+def _normalize_base64_padding(value: Any, fallback: str) -> str:
+    return value if value in ("keep", "strip", "add") else fallback
+
+
+def _normalize_decode_output(value: Any) -> str:
+    return value if value in ("text", "json") else "text"
+
+
+def _normalize_signature_mode(value: Any) -> str:
+    return value if value in ("reuse", "none", "sign") else "reuse"
+
+
+def _normalize_signature_algorithm(value: Any) -> str:
+    return value if value in ("HS256", "HS384", "HS512") else "HS256"
+
+
+def _normalize_text_input(input_value: Any) -> str:
+    if input_value is None:
+        return ""
+    if isinstance(input_value, str):
+        return input_value
+    try:
+        return json.dumps(input_value)
+    except Exception:
+        return str(input_value)
+
+
+def _add_base64_padding(value: str) -> str:
+    mod = len(value) % 4
+    if mod == 0:
+        return value
+    return value + "=" * (4 - mod)
+
+
+def _apply_base64_variant(base64_value: str, variant: str, padding: str) -> str:
+    value = base64_value
+    if variant == "url":
+        value = value.replace("+", "-").replace("/", "_")
+    if padding == "strip":
+        value = value.rstrip("=")
+    elif padding == "add":
+        value = _add_base64_padding(value)
+    return value
+
+
+def _normalize_base64_for_decode(value: str, variant: str) -> str:
+    normalized = re.sub(r"\s+", "", value)
+    if variant == "url":
+        normalized = normalized.replace("-", "+").replace("_", "/")
+    return _add_base64_padding(normalized)
+
+
+def _encode_text_to_base64(text: str) -> str:
+    encoded = base64.b64encode(text.encode("utf-8"))
+    return encoded.decode("ascii")
+
+
+def _decode_base64_to_text(value: str) -> str:
+    decoded = base64.b64decode(value)
+    return decoded.decode("utf-8", errors="replace")
+
+
+def _normalize_json_input(value: Any, label: str) -> str:
+    if value is None:
+        raise ValueError(f"{label} is required.")
+    if isinstance(value, str):
+        trimmed = value.strip()
+        if not trimmed:
+            raise ValueError(f"{label} is empty.")
+        try:
+            json.loads(trimmed)
+            return trimmed
+        except json.JSONDecodeError as error:
+            raise ValueError(f"{label} must be valid JSON: {error.msg}") from error
+    try:
+        return json.dumps(value)
+    except Exception as error:
+        raise ValueError(f"{label} could not be stringified: {error}") from error
+
+
+def _to_number(value: Any) -> float:
+    if value is None:
+        return 0
+    if isinstance(value, bool):
+        return 1.0 if value else 0.0
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if isinstance(value, float) and math.isnan(value):
+            raise ValueError(f'Value "{value}" is not a number.')
+        return float(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if text == "":
+            return 0.0
+        try:
+            if re.match(r"^[+-]?0[xX][0-9a-fA-F]+$", text) or re.match(r"^[+-]?0[bB][01]+$", text) or re.match(r"^[+-]?0[oO][0-7]+$", text):
+                return float(int(text, 0))
+            return float(text)
+        except ValueError as error:
+            raise ValueError(f'Value "{value}" is not a number.') from error
+    if isinstance(value, list):
+        if not value:
+            return 0.0
+        if len(value) == 1:
+            return _to_number(value[0])
+        raise ValueError(f'Value "{value}" is not a number.')
+    raise ValueError(f'Value "{value}" is not a number.')
+
+
+def _to_string_value(value: Any) -> str:
+    return "" if value is None else str(value)
+
+
+def _to_boolean(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lower = value.strip().lower()
+        if lower == "true":
+            return True
+        if lower == "false":
+            return False
+    return bool(value)
+
+
+def _tokenize_path(path: str) -> List[str]:
+    if not path:
+        return []
+    tokens: List[str] = []
+    current: List[str] = []
+    in_bracket = False
+    quote: Optional[str] = None
+    for ch in path:
+        if in_bracket:
+            if quote:
+                if ch == quote:
+                    quote = None
+                else:
+                    current.append(ch)
+                continue
+            if ch in ("\"", "'"):
+                quote = ch
+                continue
+            if ch == "]":
+                if current:
+                    tokens.append("".join(current))
+                    current = []
+                in_bracket = False
+                continue
+            if ch != "[":
+                current.append(ch)
+            continue
+        if ch == ".":
+            if current:
+                tokens.append("".join(current))
+                current = []
+            continue
+        if ch == "[":
+            if current:
+                tokens.append("".join(current))
+                current = []
+            in_bracket = True
+            continue
+        current.append(ch)
+    if current:
+        tokens.append("".join(current))
+    return [token for token in tokens if token]
+
+
+def _clone_value(value: Any) -> Any:
+    if isinstance(value, list):
+        return [_clone_value(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _clone_value(val) for key, val in value.items()}
+    return value
+
+
+def _set_path_value(root: Any, tokens: List[str], value: Any) -> Any:
+    if not tokens:
+        return _clone_value(value)
+
+    if isinstance(root, list):
+        copy_root: Any = [_clone_value(item) for item in root]
+    elif isinstance(root, dict):
+        copy_root = {key: _clone_value(val) for key, val in root.items()}
+    else:
+        copy_root = {}
+
+    current = copy_root
+    for index, token in enumerate(tokens):
+        is_last = index == len(tokens) - 1
+        next_token = tokens[index + 1] if not is_last else None
+        next_is_index = bool(next_token and next_token.isdigit())
+
+        def assign(container: Any, key: str, val: Any) -> None:
+            if isinstance(container, list) and key.isdigit():
+                idx = int(key)
+                if idx >= len(container):
+                    container.extend([None] * (idx - len(container) + 1))
+                container[idx] = val
+            elif isinstance(container, dict):
+                container[key] = val
+
+        def fetch(container: Any, key: str) -> Any:
+            if isinstance(container, list) and key.isdigit():
+                idx = int(key)
+                if 0 <= idx < len(container):
+                    return container[idx]
+                return None
+            if isinstance(container, dict):
+                return container.get(key)
+            return None
+
+        if is_last:
+            assign(current, token, _clone_value(value))
+            break
+
+        existing = fetch(current, token)
+        if isinstance(existing, (list, dict)):
+            next_value = _clone_value(existing)
+        else:
+            next_value = [] if next_is_index else {}
+
+        assign(current, token, next_value)
+        current = next_value
+
+    return copy_root
+
+
+def _json_set(target: Any, path: str, value: Any) -> Any:
+    tokens = _tokenize_path(str(path or "").strip())
+    if not tokens:
+        raise ValueError("JSON set requires a path.")
+    return _set_path_value(target, tokens, value)
+
+
+def _execute_transform_op(op: Dict[str, Any], context: Dict[str, Any], evaluate_path: Optional[Any]) -> Any:
+    resolved_args = [_resolve_transform_value(arg, context, evaluate_path) for arg in op.get("args", [])]
+    resolved_options = {
+        key: _resolve_transform_value(val, context, evaluate_path)
+        for key, val in (op.get("options") or {}).items()
+    }
+    op_name = op.get("op")
+    if op_name == "base64_decode":
+        variant = _normalize_base64_variant(resolved_options.get("base64"), "url")
+        output_as = _normalize_decode_output(resolved_options.get("as"))
+        normalized = _normalize_base64_for_decode(str(resolved_args[0] if resolved_args else ""), variant)
+        text = _decode_base64_to_text(normalized)
+        if output_as == "json":
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError as error:
+                raise ValueError(f"Base64 decode produced invalid JSON: {error.msg}") from error
+        return text
+    if op_name == "base64_encode":
+        variant = _normalize_base64_variant(resolved_options.get("base64"), "url")
+        padding = _normalize_base64_padding(resolved_options.get("padding"), "strip" if variant == "url" else "keep")
+        text = _normalize_text_input(resolved_args[0] if resolved_args else "")
+        base64_value = _encode_text_to_base64(text)
+        return _apply_base64_variant(base64_value, variant, padding)
+    if op_name == "jwt_decode":
+        token = str(resolved_args[0] if resolved_args else "").strip()
+        strip_bearer = _normalize_boolean(resolved_options.get("stripBearer"), True)
+        if strip_bearer and re.match(r"^bearer\s+", token, re.IGNORECASE):
+            token = re.sub(r"^bearer\s+", "", token, flags=re.IGNORECASE).strip()
+        parts = token.split(".")
+        if len(parts) < 2:
+            raise ValueError("JWT must contain at least header and payload segments.")
+        variant = _normalize_base64_variant(resolved_options.get("base64"), "url")
+        header_json = _execute_transform_op(
+            {"op": "base64_decode", "args": [parts[0]], "options": {"base64": variant, "as": "text"}},
+            context,
+            evaluate_path,
+        )
+        payload_json = _execute_transform_op(
+            {"op": "base64_decode", "args": [parts[1]], "options": {"base64": variant, "as": "text"}},
+            context,
+            evaluate_path,
+        )
+        try:
+            header = json.loads(header_json)
+        except json.JSONDecodeError as error:
+            raise ValueError(f"JWT header is not valid JSON: {error.msg}") from error
+        try:
+            payload = json.loads(payload_json)
+        except json.JSONDecodeError as error:
+            raise ValueError(f"JWT payload is not valid JSON: {error.msg}") from error
+        signature = parts[2] if len(parts) > 2 else ""
+        return {
+            "header": header,
+            "payload": payload,
+            "signature": signature,
+            "parts": {
+                "header": parts[0],
+                "payload": parts[1],
+                "signature": signature,
+            },
+        }
+    if op_name == "jwt_encode":
+        variant = _normalize_base64_variant(resolved_options.get("base64"), "url")
+        header_json = _normalize_json_input(resolved_args[0] if len(resolved_args) > 0 else None, "JWT header")
+        payload_json = _normalize_json_input(resolved_args[1] if len(resolved_args) > 1 else None, "JWT payload")
+        header_part = _execute_transform_op(
+            {"op": "base64_encode", "args": [header_json], "options": {"base64": variant, "padding": "strip" if variant == "url" else "keep"}},
+            context,
+            evaluate_path,
+        )
+        payload_part = _execute_transform_op(
+            {"op": "base64_encode", "args": [payload_json], "options": {"base64": variant, "padding": "strip" if variant == "url" else "keep"}},
+            context,
+            evaluate_path,
+        )
+        signature_mode = _normalize_signature_mode(resolved_options.get("signatureMode"))
+        signature_part = ""
+        if signature_mode == "reuse":
+            signature_part = "" if len(resolved_args) < 3 or resolved_args[2] is None else str(resolved_args[2])
+        elif signature_mode == "sign":
+            algorithm = _normalize_signature_algorithm(resolved_options.get("algorithm"))
+            secret = resolved_options.get("secret")
+            if secret is None or secret == "":
+                raise ValueError("JWT signing requires a secret.")
+            hash_map = {
+                "HS256": hashlib.sha256,
+                "HS384": hashlib.sha384,
+                "HS512": hashlib.sha512,
+            }
+            to_sign = f"{header_part}.{payload_part}"
+            digestmod = hash_map[algorithm]
+            raw = hmac.new(str(secret).encode("utf-8"), to_sign.encode("utf-8"), digestmod).digest()
+            base64_value = base64.b64encode(raw).decode("ascii")
+            signature_part = _apply_base64_variant(
+                base64_value,
+                variant,
+                "strip" if variant == "url" else "keep",
+            )
+        return f"{header_part}.{payload_part}.{signature_part}"
+    if op_name == "json_set":
+        if len(resolved_args) < 3:
+            raise ValueError("JSON set requires target, path, and value.")
+        return _json_set(resolved_args[0], resolved_args[1], resolved_args[2])
+    if op_name == "math_add":
+        return _to_number(resolved_args[0]) + _to_number(resolved_args[1])
+    if op_name == "math_sub":
+        return _to_number(resolved_args[0]) - _to_number(resolved_args[1])
+    if op_name == "math_mul":
+        return _to_number(resolved_args[0]) * _to_number(resolved_args[1])
+    if op_name == "math_div":
+        divisor = _to_number(resolved_args[1])
+        if divisor == 0:
+            raise ValueError("Division by zero.")
+        return _to_number(resolved_args[0]) / divisor
+    if op_name == "to_number":
+        return _to_number(resolved_args[0])
+    if op_name == "to_string":
+        return _to_string_value(resolved_args[0])
+    if op_name == "to_boolean":
+        return _to_boolean(resolved_args[0])
+    if op_name == "boolean_not":
+        return not _to_boolean(resolved_args[0])
+    raise ValueError(f'Unsupported transform op "{op_name}".')
+
+
+def execute_transform_ops(ops: Any, context: Dict[str, Any], evaluate_path: Optional[Any] = None) -> Dict[str, Any]:
+    output = {"updatedVars": [], "warnings": []}
+    ops_list = ops if isinstance(ops, list) else []
+    for index, op in enumerate(ops_list):
+        normalized = _normalize_transform_op(op)
+        set_name = normalized.get("set")
+        if not isinstance(set_name, str) or not set_name:
+            raise ValueError(f"Transform op {index + 1} is missing a valid output variable.")
+        value = _execute_transform_op(normalized, context, evaluate_path)
+        context[set_name] = value
+        output["updatedVars"].append(set_name)
+    return output
+
+
 def get_header_value_case_insensitive(headers: Dict[str, Any], header_name: str) -> Optional[Any]:
     """
     Return the header value for header_name from headers using case-insensitive lookup.
@@ -1047,6 +1603,63 @@ class FlowRunner:
         # but currently only accessed internally or via control thread which should be safe enough.
         return self._active_users_count
 
+    def _get_random_cache(self, context: Dict[str, Any]) -> Dict[str, Any]:
+        cache = context.get("_RANDOM_CACHE")
+        if not isinstance(cache, dict):
+            cache = {}
+            context["_RANDOM_CACHE"] = cache
+        return cache
+
+    def _resolve_special_variable(
+        self,
+        var_path: str,
+        context: Dict[str, Any],
+        *,
+        as_raw: bool = False,
+    ) -> Optional[Any]:
+        if not isinstance(context, dict):
+            return None
+
+        trimmed = var_path.strip()
+        if trimmed == "RANDOM_IP":
+            if "_RANDOM_IP" not in context:
+                random_ip = self.generate_random_ip()
+                context["_RANDOM_IP"] = random_ip
+                logger.debug(f"Generated random IP for flow run: {random_ip}")
+            return context["_RANDOM_IP"]
+
+        int_args = _parse_function_args(trimmed, "RANDOM_INT")
+        if int_args is not None:
+            min_val = _RANDOM_INT_DEFAULT_MIN
+            max_val = _RANDOM_INT_DEFAULT_MAX
+            if len(int_args) == 1:
+                parsed_max = _parse_int(int_args[0])
+                max_val = parsed_max if parsed_max is not None else _RANDOM_INT_DEFAULT_MAX
+            elif len(int_args) >= 2:
+                parsed_min = _parse_int(int_args[0])
+                parsed_max = _parse_int(int_args[1])
+                min_val = parsed_min if parsed_min is not None else _RANDOM_INT_DEFAULT_MIN
+                max_val = parsed_max if parsed_max is not None else _RANDOM_INT_DEFAULT_MAX
+            cache = self._get_random_cache(context)
+            if trimmed not in cache:
+                cache[trimmed] = _generate_random_int(min_val, max_val)
+                logger.debug(f"Generated random int for '{trimmed}': {cache[trimmed]}")
+            return cache[trimmed] if as_raw else str(cache[trimmed])
+
+        string_args = _parse_function_args(trimmed, "RANDOM_STRING")
+        if string_args is not None:
+            length = _RANDOM_STRING_DEFAULT_LENGTH
+            if len(string_args) >= 1:
+                parsed_length = _parse_int(string_args[0])
+                length = parsed_length if parsed_length is not None else _RANDOM_STRING_DEFAULT_LENGTH
+            cache = self._get_random_cache(context)
+            if trimmed not in cache:
+                cache[trimmed] = _generate_random_string(length)
+                logger.debug(f"Generated random string for '{trimmed}': {cache[trimmed]}")
+            return cache[trimmed]
+
+        return None
+
     def _substitute_variables(
         self,
         data: Union[str, Dict, List],
@@ -1071,6 +1684,16 @@ class FlowRunner:
                     if len(parts) != 2:
                         raise ValueError("Invalid ##VAR format, expected type:path")
                     var_type, var_path = parts
+                    var_path = var_path.strip()
+
+                    special_value = self._resolve_special_variable(var_path, context, as_raw=(var_type == "unquoted"))
+                    if special_value is not None:
+                        if var_type == "string":
+                            return str(special_value)
+                        if var_type == "unquoted":
+                            return special_value
+                        logger.warning(f"Unsupported ##VAR type: '{var_type}' in token '{data}'. Treating as string.")
+                        return str(special_value)
 
                     # Get value using the robust getter
                     value = get_value_from_context(context, var_path)
@@ -1101,7 +1724,7 @@ class FlowRunner:
 
             # Regular {{variable.or[0].path}} Substitution - For URLs, headers, string parts of body
             # This always results in a string substitution.
-            pattern = r"\{\{([\w\.\[\]]+?)\}\}" # Non-greedy match inside braces
+            pattern = r"\{\{([^}]+)\}\}" # Non-greedy match inside braces
             new_string = data
             try:
                 # Use finditer for non-overlapping matches and correct replacement
@@ -1118,29 +1741,21 @@ class FlowRunner:
                     # Append the literal text before the match
                     result_parts.append(data[last_end:start])
 
-                    # Handle special reserved variable: RANDOM_IP
-                    if var_path == 'RANDOM_IP':
-                        # Generate random IP once per flow run and cache it in context
-                        if '_RANDOM_IP' not in context:
-                            random_ip = self.generate_random_ip()
-                            context['_RANDOM_IP'] = random_ip
-                            logger.debug(f"Generated random IP for flow run: {random_ip}")
-                        value_str = context['_RANDOM_IP']
-                        result_parts.append(value_str)
-                        last_end = end
-                        continue
-
-                    # Get the value from context
-                    value = get_value_from_context(context, var_path)
-
-                    # Determine the string representation for substitution
-                    if value is _MISSING:
-                         logger.warning(f"Variable '{{{{{var_path}}}}}' not found in context. Substituting with empty string.")
-                         value_str = ""
-                    elif value is None:
-                         value_str = "" # Substitute None as empty string in {{}} context
+                    special_value = self._resolve_special_variable(var_path, context, as_raw=False)
+                    if special_value is not None:
+                        value_str = str(special_value)
                     else:
-                         value_str = str(value) # Convert other types to string
+                        # Get the value from context
+                        value = get_value_from_context(context, var_path)
+
+                        # Determine the string representation for substitution
+                        if value is _MISSING:
+                             logger.warning(f"Variable '{{{{{var_path}}}}}' not found in context. Substituting with empty string.")
+                             value_str = ""
+                        elif value is None:
+                             value_str = "" # Substitute None as empty string in {{}} context
+                        else:
+                             value_str = str(value) # Convert other types to string
 
                     if for_url:
                         # Avoid encoding full URLs or plain hostnames with optional ports
@@ -2148,6 +2763,30 @@ class FlowRunner:
                 break
 
 
+    async def _execute_transform_step(
+        self,
+        step: TransformStep,
+        context: Dict[str, Any],
+        depth: int,
+        user_id_log: str,
+    ) -> None:
+        """Executes a TransformStep and updates context with outputs."""
+        indent = "  " * depth
+        step_identifier = f"'{step.name}' ({step.id})" if step.name else f"({step.id})"
+        try:
+            ops = step.ops or []
+            logger.debug(f"{indent}User {user_id_log}: Transform {step_identifier}: Executing {len(ops)} ops.")
+            output = execute_transform_ops(ops, context, evaluate_path=get_value_from_context)
+            logger.debug(f"{indent}User {user_id_log}: Transform {step_identifier}: Updated vars {output.get('updatedVars', [])}.")
+        except Exception as exc:
+            logger.error(
+                f"{indent}User {user_id_log}: Transform {step_identifier} failed: {exc}",
+                exc_info=self.config.debug,
+            )
+            set_value_in_context(context, 'flow_error', f"Transform {step_identifier} failed: {exc}")
+            return
+
+
     async def _execute_steps(
         self,
         steps: List[Union[FlowStep, Dict]], # Input list might contain dicts or models
@@ -2185,7 +2824,7 @@ class FlowRunner:
 
             # --- FIX: Dynamic Validation of Steps ---
             step_instance = None # Holds the validated Pydantic model instance
-            if isinstance(step_data, (RequestStep, ConditionStep, LoopStep)):
+            if isinstance(step_data, (RequestStep, ConditionStep, LoopStep, TransformStep)):
                  # Already a validated model (likely from top-level parsing)
                  step_instance = step_data
             elif isinstance(step_data, dict):
@@ -2207,6 +2846,8 @@ class FlowRunner:
                          step_instance = ConditionStep.model_validate(step_data)
                      elif step_type == 'loop':
                          step_instance = LoopStep.model_validate(step_data)
+                     elif step_type == 'transform':
+                         step_instance = TransformStep.model_validate(step_data)
                      else:
                          raise ValueError(f"Unknown step type: {step_type}")
 
@@ -2315,6 +2956,15 @@ class FlowRunner:
                         session,
                         base_headers,
                         flow_headers,
+                        context,
+                        depth,
+                        user_id_log,
+                    )
+
+                # --- Transform Step ---
+                elif isinstance(step_instance, TransformStep):
+                    await self._execute_transform_step(
+                        step_instance,
                         context,
                         depth,
                         user_id_log,
@@ -2560,6 +3210,7 @@ class FlowRunner:
 FlowMap.model_rebuild()
 ConditionStep.model_rebuild()
 LoopStep.model_rebuild()
+TransformStep.model_rebuild()
 StartRequest.model_rebuild()
 # Also rebuild RequestStep explicitly in case forward refs were missed? Not strictly needed here.
 RequestStep.model_rebuild() # Add just in case, though not strictly necessary here

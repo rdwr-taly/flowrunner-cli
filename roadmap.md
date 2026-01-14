@@ -254,9 +254,11 @@ By meticulously addressing these points, the AI agent can successfully upgrade t
 
 ## Project Roadmap
 
-### v1.1.3 (Current)
+### v1.2.0 (Current)
 
 - [x] **Continuous Flow Runner (Simplified):** FlowRunner now runs indefinitely when started via the API and resets context between iterations.
 - [x] **Validation & Error Handling Improvements:** API responses and internal logging provide clearer details on invalid configurations and flow errors.
 - [x] **UI/UX Tweaks:** Logging levels can be adjusted via configuration; metrics endpoints expose detailed runtime information.
 - [x] **Automated Testing Framework:** Unit and end-to-end test suites exercise the FlowRunner core and API.
+- [x] **Transform Steps:** Transform operations execute in order and update context variables.
+- [x] **Randomization Variables:** `RANDOM_INT` and `RANDOM_STRING` are supported and cached per flow iteration.

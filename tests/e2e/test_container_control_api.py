@@ -44,7 +44,7 @@ import pytest
 import pytest_asyncio
 import json
 
-import container_control
+from tests.e2e import container_control_stub as container_control
 from tests.e2e.mock_server import create_mock_server, shutdown_mock_server
 
 
