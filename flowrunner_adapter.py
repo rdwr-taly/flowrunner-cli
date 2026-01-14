@@ -9,6 +9,8 @@ from __future__ import annotations
 import asyncio
 import threading
 import logging
+import os
+import signal
 from typing import Any, Dict, Optional
 
 from app_adapter import ApplicationAdapter
@@ -35,23 +37,16 @@ class FlowRunnerAdapter(ApplicationAdapter):
         self.background_thread: Optional[threading.Thread] = None
         self.metrics: Optional[Metrics] = None
         self._shutdown_event = threading.Event()
+        self._run_once_completed = False
 
     def start(self, start_payload: Dict[str, Any], *, ensure_user) -> Any:
         """
-        Start FlowRunner with the provided configuration and flowmap.
-        
+        Start FlowRunner with the provided configuration and flowmap(s).
+
         Expected payload structure:
         {
-            "config": {
-                "flow_target_url": "http://example.com",
-                "sim_users": 10,
-                "debug": false,
-                ...
-            },
-            "flowmap": {
-                "steps": [...],
-                ...
-            }
+            "config": { ... },
+            "flowmap": { ... } | "flowmaps": [ {...}, {...} ]
         }
         """
         logger.info("Starting FlowRunner with payload")
@@ -60,6 +55,8 @@ class FlowRunnerAdapter(ApplicationAdapter):
         if self.flow_runner or self.background_thread:
             logger.info("Stopping existing FlowRunner instance before starting new one")
             self.stop()
+
+        self._run_once_completed = False
 
         try:
             # Parse and validate the payload
@@ -127,18 +124,40 @@ class FlowRunnerAdapter(ApplicationAdapter):
         logger.info("Update requested - FlowRunner does not support live updates")
         return False
 
+    def _compute_rps(self) -> float:
+        """Fetch a fresh RPS value from the FlowRunner event loop."""
+        if not self.metrics:
+            return 0.0
+
+        if self.event_loop and self.event_loop.is_running():
+            try:
+                future = asyncio.run_coroutine_threadsafe(
+                    self.metrics.get_rps(),
+                    self.event_loop,
+                )
+                return float(future.result(timeout=1.0))
+            except Exception as exc:
+                logger.debug(f"Failed to refresh RPS metric: {exc}")
+
+        # Fallback to the cached value if we cannot refresh
+        try:
+            return float(self.metrics.last_rps_value)
+        except Exception:
+            return 0.0
+
     def get_metrics(self) -> Dict[str, Any]:
         """Return current FlowRunner metrics."""
         if not self.metrics:
             return {}
-        
+
         try:
+            rps_value = self._compute_rps()
             # Get metrics synchronously (the metrics methods are not async)
             return {
                 "flow_runner": {
                     "running": self.flow_runner is not None and getattr(self.flow_runner, 'running', False),
-                    "rps": self.metrics.last_rps_value,
-                    "total_requests": len(self.metrics.request_timestamps),
+                    "rps": rps_value,
+                    "total_requests": getattr(self.metrics, "total_requests", len(self.metrics.request_timestamps)),
                     "flow_count": self.metrics.flow_count,
                     "avg_flow_duration_ms": (
                         self.metrics.flow_duration_sum / self.metrics.flow_count * 1000
@@ -157,7 +176,10 @@ class FlowRunnerAdapter(ApplicationAdapter):
         
         if "error" in metrics:
             return []
-        
+
+        rps_value = metrics.get("rps", 0)
+        total_requests = metrics.get("total_requests", 0)
+
         lines = []
         
         # Add Prometheus metrics
@@ -167,11 +189,11 @@ class FlowRunnerAdapter(ApplicationAdapter):
         
         lines.append("# HELP flowrunner_requests_per_second Current requests per second")
         lines.append("# TYPE flowrunner_requests_per_second gauge")
-        lines.append(f"flowrunner_requests_per_second {metrics.get('rps', 0)}")
+        lines.append(f"flowrunner_requests_per_second {rps_value}")
         
         lines.append("# HELP flowrunner_total_requests_total Total number of requests made")
         lines.append("# TYPE flowrunner_total_requests_total counter")
-        lines.append(f"flowrunner_total_requests_total {metrics.get('total_requests', 0)}")
+        lines.append(f"flowrunner_total_requests_total {total_requests}")
         
         lines.append("# HELP flowrunner_flows_completed_total Total number of flows completed")
         lines.append("# TYPE flowrunner_flows_completed_total counter")
@@ -202,7 +224,8 @@ class FlowRunnerAdapter(ApplicationAdapter):
             self.flow_runner = FlowRunner(
                 config=start_request.config,
                 flowmap=start_request.flowmap,
-                metrics=self.metrics
+                flowmaps=start_request.flowmaps,
+                metrics=self.metrics,
             )
             
             # Run until shutdown is requested
@@ -230,6 +253,9 @@ class FlowRunnerAdapter(ApplicationAdapter):
                 except Exception as e:
                     logger.warning(f"Error during event loop cleanup: {e}")
             
+            if self._run_once_completed:
+                self._request_process_shutdown()
+
             logger.info("FlowRunner background thread finished")
 
     async def _run_flow_runner_lifecycle(self) -> None:
@@ -239,6 +265,12 @@ class FlowRunnerAdapter(ApplicationAdapter):
         try:
             logger.info("Starting FlowRunner generation")
             await self.flow_runner.start_generating()
+
+            run_once_mode = bool(getattr(self.flow_runner, "run_once", False))
+            if run_once_mode and not self._shutdown_event.is_set():
+                logger.info("FlowRunner completed run-once execution; initiating shutdown.")
+                self._run_once_completed = True
+                self._shutdown_event.set()
             
             # Wait for shutdown signal
             while not self._shutdown_event.is_set():
@@ -254,6 +286,17 @@ class FlowRunnerAdapter(ApplicationAdapter):
                     await self.flow_runner.stop_generating()
                 except Exception as e:
                     logger.warning(f"Error stopping FlowRunner: {e}")
+
+    def _request_process_shutdown(self) -> None:
+        """
+        Request termination of the current process after a run-once execution.
+        Primarily used in container-control scenarios to end the container lifecycle.
+        """
+        try:
+            logger.info("Run-once execution complete; terminating container process.")
+            os.kill(os.getpid(), signal.SIGTERM)
+        except Exception as exc:
+            logger.warning(f"Failed to terminate process after run-once: {exc}")
 
     def pre_start_hooks(self, start_payload: Dict[str, Any]) -> None:
         """Optional hook called before starting FlowRunner."""

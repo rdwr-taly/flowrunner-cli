@@ -44,6 +44,7 @@ import pytest
 import logging
 import aiohttp
 import copy
+from pydantic import ValidationError
 
 from flow_runner import (
     FlowRunner,
@@ -54,7 +55,11 @@ from flow_runner import (
     ConditionStep,
     ConditionData,
     Metrics,
-    get_value_from_context, _MISSING, set_value_in_context,
+    StartRequest,
+    get_value_from_context,
+    _MISSING,
+    set_value_in_context,
+    logger as fr_logger,
 )
 
 
@@ -66,6 +71,20 @@ def base_config() -> ContainerConfig:
 @pytest.fixture
 def empty_flow() -> FlowMap:
     return FlowMap(name="test", steps=[], staticVars={"static": "val"})
+
+
+def test_configure_logging_debug(empty_flow):
+    cfg = ContainerConfig(flow_target_url="http://example.com", sim_users=1, debug=True)
+    make_runner(cfg, empty_flow)
+    assert fr_logger.level == logging.DEBUG
+    assert all(h.level == logging.DEBUG for h in fr_logger.handlers)
+
+
+def test_configure_logging_info(empty_flow):
+    cfg = ContainerConfig(flow_target_url="http://example.com", sim_users=1, debug=False)
+    make_runner(cfg, empty_flow)
+    assert fr_logger.level == logging.INFO
+    assert all(h.level == logging.INFO for h in fr_logger.handlers)
 
 
 def make_runner(config: ContainerConfig, flow: FlowMap) -> FlowRunner:
@@ -82,6 +101,16 @@ def test_flowmap_accepts_numeric_id():
     assert fm.id == 12345
 
 
+def test_start_request_with_flowmaps(base_config, empty_flow):
+    sr = StartRequest(config=base_config, flowmaps=[empty_flow])
+    assert sr.flowmaps is not None and sr.flowmap is None
+
+
+def test_start_request_requires_flow(base_config):
+    with pytest.raises(ValidationError):
+        StartRequest(config=base_config)
+
+
 def test_init_override_step_url_host_default(base_config, empty_flow):
     runner = make_runner(base_config, empty_flow)
     assert runner.config.override_step_url_host is True
@@ -91,6 +120,28 @@ def test_init_override_step_url_host_false(empty_flow):
     cfg = ContainerConfig(flow_target_url="http://example.com", sim_users=1, override_step_url_host=False)
     runner = make_runner(cfg, empty_flow)
     assert runner.config.override_step_url_host is False
+
+
+@pytest.mark.asyncio
+async def test_metrics_resets_after_threshold():
+    metrics = Metrics()
+    metrics.MAX_FLOW_COUNT = 3
+    for _ in range(3):
+        await metrics.record_flow_duration(1.0)
+    assert metrics.flow_count == 0
+    assert metrics.flow_duration_sum == 0.0
+    assert await metrics.get_average_flow_duration_ms() == 0.0
+
+
+@pytest.mark.asyncio
+async def test_metrics_increment_updates_rps():
+    metrics = Metrics()
+    await metrics.increment()
+    await metrics.increment()
+    assert metrics.last_rps_value >= 1
+    await asyncio.sleep(1.1)
+    await metrics.get_rps()
+    assert metrics.last_rps_value == 0.0
 
 
 def test_get_value_from_context_basic():
@@ -134,6 +185,52 @@ def test_extract_data_non_dict_body(base_config, empty_flow):
     headers = {}
     runner._extract_data(body, {"user": "user.id"}, ctx, 200, headers)
     assert ctx["user"] is None
+
+
+def test_extract_data_root_list(base_config, empty_flow):
+    runner = make_runner(base_config, empty_flow)
+    ctx: Dict[str, Any] = {}
+    body = [{"order_id": 1}, {"order_id": 2}]
+    headers = {}
+    rules = {
+        "first": "body.[0].order_id",
+        "second": "body[1].order_id",
+    }
+    runner._extract_data(body, rules, ctx, 200, headers)
+    assert ctx["first"] == 1
+    assert ctx["second"] == 2
+
+
+@pytest.mark.asyncio
+async def test_url_substitution_plain_encodes(base_config, empty_flow):
+    runner = make_runner(base_config, empty_flow)
+    context = {"pwd": "p@ss word!"}
+    out = runner._substitute_variables("{{pwd}}", context, for_url=True)
+    assert out == "p%40ss%20word%21"
+
+
+@pytest.mark.asyncio
+async def test_url_substitution_preserves_already_encoded(base_config, empty_flow):
+    runner = make_runner(base_config, empty_flow)
+    context = {"pwd": "p%40ss%21"}
+    out = runner._substitute_variables("{{pwd}}", context, for_url=True)
+    assert out == "p%40ss%21"
+
+
+@pytest.mark.asyncio
+async def test_url_substitution_normalizes_partial_encoding(base_config, empty_flow):
+    runner = make_runner(base_config, empty_flow)
+    context = {"pwd": "p@ss%21word"}
+    out = runner._substitute_variables("{{pwd}}", context, for_url=True)
+    assert out == "p%40ss%21word"
+
+
+@pytest.mark.asyncio
+async def test_url_substitution_handles_malformed_percent(base_config, empty_flow):
+    runner = make_runner(base_config, empty_flow)
+    context = {"pwd": "abc%zz"}
+    out = runner._substitute_variables("{{pwd}}", context, for_url=True)
+    assert out == "abc%25zz"
 
 
 @pytest.mark.asyncio
@@ -474,6 +571,42 @@ async def test_run_stop_continuous(monkeypatch, base_config, empty_flow):
 
 
 @pytest.mark.asyncio
+async def test_simulate_user_lifecycle_run_once(monkeypatch, empty_flow):
+    cfg = ContainerConfig(
+        flow_target_url="http://example.com",
+        sim_users=1,
+        min_sleep_ms=0,
+        max_sleep_ms=0,
+        run_once=True,
+    )
+    metrics = Metrics()
+    metrics.increment = AsyncMock()
+    metrics.record_flow_duration = AsyncMock()
+    runner = FlowRunner(cfg, empty_flow, metrics)
+
+    connector = MagicMock(closed=False, close=AsyncMock())
+    monkeypatch.setattr(runner, "create_aiohttp_connector", lambda: connector)
+
+    session = MagicMock(closed=False, close=AsyncMock())
+    monkeypatch.setattr(runner, "create_session", lambda conn: session)
+
+    contexts = []
+
+    async def fake_execute_steps(steps, session_obj, base_headers=None, flow_headers=None, context=None, depth=0):
+        contexts.append(context.copy())
+
+    monkeypatch.setattr(runner, "_execute_steps", fake_execute_steps)
+    monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+
+    runner.running = True
+    await runner.simulate_user_lifecycle(0)
+
+    assert len(contexts) == 1
+    assert contexts[0].get("flowInstance") == 1
+    assert runner.running is False
+
+
+@pytest.mark.asyncio
 async def test_condition_branch_passes_copied_context(monkeypatch, base_config):
     cond_step = ConditionStep(
         id="c1",
@@ -676,6 +809,15 @@ def test_container_config_alias_flow_cycle_delay_ms():
     assert cfg.flow_cycle_delay_ms == 1500
 
 
+def test_container_config_alias_run_once():
+    cfg = ContainerConfig(
+        flow_target_url="http://example.com",
+        sim_users=1,
+        **{"Run Once": True},
+    )
+    assert cfg.run_once is True
+
+
 def test_container_config_validation_errors():
     pydantic = sys.modules["pydantic"]
     with pytest.raises(pydantic.ValidationError):
@@ -747,3 +889,178 @@ def test_substitute_variables_unquoted_and_malformed(base_config, empty_flow):
         runner._substitute_variables("##VAR:unquoted:name:extra##", context)
         is None
     )
+
+
+@pytest.mark.asyncio
+async def test_simulate_user_lifecycle_moves_to_next_flow_on_failure(base_config):
+    flow1 = FlowMap(name="flow1", steps=[])
+    flow2 = FlowMap(name="flow2", steps=[])
+    metrics = Metrics()
+    metrics.increment = AsyncMock()
+    metrics.record_flow_duration = AsyncMock()
+    runner = FlowRunner(base_config, flow1, metrics, flowmaps=[flow1, flow2])
+    runner.config.min_sleep_ms = runner.config.max_sleep_ms = 0
+    runner.running = True
+
+    class DummyConnector:
+        closed = False
+
+        async def close(self):
+            self.closed = True
+
+    connector = DummyConnector()
+    runner.create_aiohttp_connector = MagicMock(return_value=connector)
+
+    dummy_session = MagicMock()
+    dummy_session.closed = False
+
+    async def close_session():
+        dummy_session.closed = True
+
+    dummy_session.close = AsyncMock(side_effect=close_session)
+    runner.create_session = MagicMock(return_value=dummy_session)
+
+    call_errors = []
+
+    async def fake_execute_steps(steps, session, base_headers, flow_headers, context, depth=0):
+        if not call_errors:
+            set_value_in_context(context, "flow_error", "boom")
+        else:
+            runner.running = False
+        call_errors.append(get_value_from_context(context, "flow_error"))
+
+    runner._execute_steps = AsyncMock(side_effect=fake_execute_steps)
+
+    await runner.simulate_user_lifecycle(user_id=0)
+
+    assert call_errors[0] == "boom"
+    assert call_errors[1] is None
+
+
+@pytest.mark.asyncio
+async def test_simulate_user_lifecycle_restarts_single_flow_after_failure(base_config):
+    flow = FlowMap(name="solo", steps=[])
+    metrics = Metrics()
+    metrics.increment = AsyncMock()
+    metrics.record_flow_duration = AsyncMock()
+    runner = FlowRunner(base_config, flow, metrics)
+    runner.config.min_sleep_ms = runner.config.max_sleep_ms = 0
+    runner.running = True
+
+    class DummyConnector:
+        closed = False
+
+        async def close(self):
+            self.closed = True
+
+    connector = DummyConnector()
+    runner.create_aiohttp_connector = MagicMock(return_value=connector)
+
+    dummy_session = MagicMock()
+    dummy_session.closed = False
+
+    async def close_session():
+        dummy_session.closed = True
+
+    dummy_session.close = AsyncMock(side_effect=close_session)
+    runner.create_session = MagicMock(return_value=dummy_session)
+
+    call_errors = []
+
+    async def fake_execute_steps(steps, session, base_headers, flow_headers, context, depth=0):
+        if not call_errors:
+            set_value_in_context(context, "flow_error", "boom")
+        else:
+            runner.running = False
+        call_errors.append(get_value_from_context(context, "flow_error"))
+
+    runner._execute_steps = AsyncMock(side_effect=fake_execute_steps)
+
+    await runner.simulate_user_lifecycle(user_id=0)
+
+    assert call_errors[0] == "boom"
+    assert call_errors[1] is None
+
+
+@pytest.mark.asyncio
+async def test_flow_concurrency_disabled(monkeypatch, empty_flow):
+    cfg = ContainerConfig(
+        flow_target_url="http://example.com",
+        sim_users=2,
+        allow_flow_concurrency=False,
+        min_sleep_ms=0,
+        max_sleep_ms=0,
+    )
+    metrics = Metrics()
+    metrics.increment = AsyncMock()
+    metrics.record_flow_duration = AsyncMock()
+    runner = FlowRunner(cfg, empty_flow, metrics, flowmaps=[empty_flow])
+    runner.running = True
+
+    concurrent = {"count": 0, "max": 0}
+
+    async def fake_execute_steps(*args, **kwargs):
+        concurrent["count"] += 1
+        concurrent["max"] = max(concurrent["max"], concurrent["count"])
+        await asyncio.sleep(0.05)
+        concurrent["count"] -= 1
+
+    monkeypatch.setattr(runner, "_execute_steps", fake_execute_steps)
+    monkeypatch.setattr(runner, "create_aiohttp_connector", lambda: MagicMock(closed=False, close=AsyncMock()))
+    monkeypatch.setattr(runner, "create_session", lambda conn: MagicMock(closed=False, close=AsyncMock()))
+
+    async def stop_later():
+        await asyncio.sleep(0.2)
+        runner.running = False
+
+    task1 = asyncio.create_task(runner.simulate_user_lifecycle(0))
+    task2 = asyncio.create_task(runner.simulate_user_lifecycle(1))
+    stopper = asyncio.create_task(stop_later())
+    await asyncio.gather(task1, task2, stopper)
+
+    assert concurrent["max"] == 1
+
+
+@pytest.mark.asyncio
+async def test_flow_distribution_without_concurrency(monkeypatch):
+    flow1 = FlowMap(name="flow1", description=None, headers=None, steps=[], staticVars={"fname": "flow1"})
+    flow2 = FlowMap(name="flow2", description=None, headers=None, steps=[], staticVars={"fname": "flow2"})
+    cfg = ContainerConfig(
+        flow_target_url="http://example.com",
+        sim_users=2,
+        allow_flow_concurrency=False,
+        min_sleep_ms=0,
+        max_sleep_ms=0,
+    )
+    metrics = Metrics()
+    metrics.increment = AsyncMock()
+    metrics.record_flow_duration = AsyncMock()
+    runner = FlowRunner(cfg, flow1, metrics, flowmaps=[flow1, flow2])
+    runner.running = True
+
+    concurrent = {"running": set(), "max": 0, "duplicate": False}
+
+    async def fake_execute_steps(steps, session, base_headers, flow_headers, context, depth=0):
+        fname = context.get("fname")
+        if fname in concurrent["running"]:
+            concurrent["duplicate"] = True
+        concurrent["running"].add(fname)
+        concurrent["max"] = max(concurrent["max"], len(concurrent["running"]))
+        await asyncio.sleep(0.05)
+        concurrent["running"].remove(fname)
+
+    monkeypatch.setattr(runner, "_execute_steps", fake_execute_steps)
+    monkeypatch.setattr(runner, "create_aiohttp_connector", lambda: MagicMock(closed=False, close=AsyncMock()))
+    monkeypatch.setattr(runner, "create_session", lambda conn: MagicMock(closed=False, close=AsyncMock()))
+
+    async def stop_later():
+        await asyncio.sleep(0.2)
+        runner.running = False
+
+    task1 = asyncio.create_task(runner.simulate_user_lifecycle(0))
+    task2 = asyncio.create_task(runner.simulate_user_lifecycle(1))
+    stopper = asyncio.create_task(stop_later())
+    await asyncio.gather(task1, task2, stopper)
+
+    assert not concurrent["duplicate"]
+    assert concurrent["max"] == 2

@@ -13,6 +13,7 @@
         "method": "POST",
         "payload_template": {
           "config": {
+            "Allow Flow Concurrency": "{{env.ALLOW_FLOW_CONCURRENCY}}",
             "Debug": "{{env.DEBUG_MODE}}",
             "Flow Cycle Delay MS": "{{env.FLOW_CYCLE_DELAY_MS}}",
             "Flow Target DNS Override": "{{env.FLOW_TARGET_DNS_OVERRIDE}}",
@@ -23,7 +24,7 @@
             "Simulated Users": "{{env.SIM_USERS}}",
             "XFF Header Name": "{{env.XFF_HEADER_NAME}}"
           },
-          "flowmap": "{{flowmap_json_for_env.FLOWMAP_ID}}"
+          "flowmaps": "{{flowmap_json_for_env.FLOWMAP_IDS}}"
         },
         "payload_template_type": "custom"
       },
@@ -66,19 +67,19 @@
         "type": "string"
       },
       {
-        "default_value": "10",
+        "default_value": 10,
         "label": "Simulated Users",
         "name": "SIM_USERS",
         "type": "integer"
       },
       {
-        "default_value": "100",
+        "default_value": 100,
         "label": "Minimum Step Sleep MS",
         "name": "MIN_SLEEP_MS",
         "type": "integer"
       },
       {
-        "default_value": "1000",
+        "default_value": 1000,
         "label": "Maximum Step Sleep MS",
         "name": "MAX_SLEEP_MS",
         "type": "integer"
@@ -89,35 +90,38 @@
         "type": "integer"
       },
       {
-        "default_value": "true",
+        "default_value": true,
         "label": "Override Step URL Host",
         "name": "OVERRIDE_STEP_URL_HOST",
         "type": "boolean"
       },
       {
-        "default_value": "false",
+        "default_value": false,
         "label": "Debug",
         "name": "DEBUG_MODE",
         "type": "boolean"
       },
       {
-        "label": "Select FlowMap",
-        "name": "FLOWMAP_ID",
+        "label": "Select FlowMaps",
+        "name": "FLOWMAP_IDS",
         "required": true,
-        "type": "string",
-        "ui_type": "flowmap_select"
+        "type": "array",
+        "ui_type": "flowmap_multi_select"
+      },
+      {
+        "__idx": 1757848679584,
+        "default_value": true,
+        "label": "Allow Flow Concurrency",
+        "name": "ALLOW_FLOW_CONCURRENCY",
+        "type": "boolean"
       }
     ]
   },
   "deploymentContext": "app",
-  "description": "Execute multi-step API flows with Container Control v2.0 during a scheduled time window.",
-  "displayName": "Scheduled FlowRunner",
+  "description": "Execute multi-step API flows continuously with Container Control v2.0.",
+  "displayName": "FlowRunner",
   "icon": "fas fa-project-diagram",
-  "id": "scheduled-flowrunner-cli",
-  "image": {
-    "repo_tag": "razor29/flowrunner-cli:v1.1.3",
-    "description": ""
-  },
+  "id": "flowrunner-cli",
   "monitoring": {
     "prometheus": {
       "enabled": true,
@@ -125,19 +129,8 @@
       "scrape_port_number": 8080
     }
   },
-  "scheduling_fields": {
-    "end_time_utc": {
-      "label": "End Time (UTC)",
-      "required": true
-    },
-    "start_time_utc": {
-      "label": "Start Time (UTC)",
-      "required": true
-    },
-    "type": "one_time"
-  },
   "subCategory": "API Simulation",
-  "taskLifecycle": "scheduled",
+  "taskLifecycle": "stateful",
   "ui": {
     "card_basic_metrics": [
       {
@@ -162,18 +155,18 @@
     ],
     "card_primary_metric": {
       "label": "RPS",
-      "source_path": "flow_runner.rps",
+      "source_path": "adapter_metrics.flow_runner.rps",
       "unit": "rps"
     },
     "card_secondary_metrics": [
       {
         "label": "Active Users",
-        "source_path": "flow_runner.active_users",
+        "source_path": "adapter_metrics.flow_runner.active_users",
         "unit": ""
       },
       {
         "label": "Avg Flow Duration",
-        "source_path": "flow_runner.avg_flow_duration_ms",
+        "source_path": "adapter_metrics.flow_runner.avg_flow_duration_ms",
         "unit": "ms"
       }
     ],
@@ -189,10 +182,15 @@
           "FLOW_CYCLE_DELAY_MS",
           "OVERRIDE_STEP_URL_HOST",
           "DEBUG_MODE",
-          "FLOWMAP_ID"
+          "FLOWMAP_IDS",
+          "ALLOW_FLOW_CONCURRENCY"
         ],
         "title": "FlowRunner Settings"
       }
     ]
+  },
+  "image": {
+    "repo_tag": "razor29/flowrunner-cli:v1.1.4",
+    "description": ""
   }
 }

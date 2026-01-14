@@ -18,7 +18,7 @@ from pydantic import (
     model_validator,
     ConfigDict,
 )
-from ipaddress import ip_address, AddressValueError
+from ipaddress import ip_address, AddressValueError, ip_network
 from urllib.parse import (
     urlparse,
     urlunparse,
@@ -37,7 +37,11 @@ from typing import Annotated
 
 # --- Logging Setup ---
 logger = logging.getLogger("FlowRunner")
-if not logger.hasHandlers():
+# Ensure we don't lose logs if a parent handler exists: only rely on parent
+# handlers when we truly intend to propagate. If we are not going to
+# propagate, we must attach our own handler regardless of parent state.
+added_handler = False
+if not logger.handlers:  # Only check handlers on this logger, not parents
     console_handler = logging.StreamHandler()
     console_handler.setLevel(logging.INFO)
     # Using the "Z" suffix per your second version:
@@ -45,7 +49,11 @@ if not logger.hasHandlers():
     formatter.converter = time.gmtime # Ensure UTC timestamps in formatter
     console_handler.setFormatter(formatter)
     logger.addHandler(console_handler)
-logger.propagate = False # Prevent duplicate logs if root logger is configured
+    added_handler = True
+# If we added our own handler, disable propagation to avoid duplicates.
+# If we did not add a handler (parent handlers exist), keep propagate=True so
+# logs still flow to the root/uvicorn handlers.
+logger.propagate = not added_handler
 
 # --- Exports for flow_container_control ---
 __all__ = [
@@ -68,6 +76,10 @@ class RequestStep(BaseStep):
     type: Literal['request'] = Field(..., description="Specifies the step type as 'request'")
     method: str = Field(..., description="HTTP method (GET, POST, PUT, etc.)")
     url: str = Field(..., description="URL path (relative to target) or full URL. Can contain {{variables}}.")
+    urlEncode: bool = Field(
+        True,
+        description="Whether to URL-encode variable substitutions in ``url``. Disable if values are pre-encoded.",
+    )
     headers: Optional[Dict[str, str]] = Field(default_factory=dict, description="Headers specific to this request. Can contain {{variables}}.")
     body: Optional[Union[Dict[str, Any], str]] = Field(None, description="Request body (JSON object or raw string). Can contain {{variables}}.")
     extract: Optional[Dict[str, str]] = Field(default_factory=dict, description="Mapping of variable names to extract from response using path notation (e.g., 'token': 'body.data.sessionToken', 'firstId': 'body.data.items[0].id', 'status_code': '.status', 'header_val': 'headers.Content-Type')") # Updated description with prefixes
@@ -183,6 +195,20 @@ class ContainerConfig(BaseModel):
             "If not set, a random delay between min_sleep_ms and max_sleep_ms is used."
         ),
     )
+    allow_flow_concurrency: bool = Field(
+        default=True,
+        description=(
+            "Allow the same flow definition to run concurrently across multiple simulated users. "
+            "If set to False, each flowmap is executed by at most one user at a time."
+        ),
+    )
+    run_once: bool = Field(
+        default=False,
+        description=(
+            "If true, execute provided flow(s) only once and then stop the runner/container lifecycle. "
+            "Default is continuous operation."
+        ),
+    )
 
     class Config:
         populate_by_name = True
@@ -195,7 +221,9 @@ class ContainerConfig(BaseModel):
             'max_sleep_ms': 'Maximum Step Sleep MS',
             'debug': 'Debug',
             'override_step_url_host': 'Override Step URL Host',
-            'flow_cycle_delay_ms': 'Flow Cycle Delay MS'
+            'flow_cycle_delay_ms': 'Flow Cycle Delay MS',
+            'allow_flow_concurrency': 'Allow Flow Concurrency',
+            'run_once': 'Run Once',
         }.get(field_name, field_name)
         extra = "allow" # Allow extra fields but ignore them
 
@@ -224,7 +252,16 @@ class ContainerConfig(BaseModel):
 
 class StartRequest(BaseModel):
     config: ContainerConfig
-    flowmap: FlowMap
+    flowmap: Optional[FlowMap] = None
+    flowmaps: Optional[List[FlowMap]] = None
+
+    @model_validator(mode="after")
+    def check_flowmaps(cls, values: "StartRequest") -> "StartRequest":
+        if not values.flowmap and not values.flowmaps:
+            raise ValueError("Either 'flowmap' or 'flowmaps' must be provided")
+        if values.flowmap and values.flowmaps:
+            raise ValueError("Provide only one of 'flowmap' or 'flowmaps'")
+        return values
 
 # ---------------------------
 # Metrics Tracking
@@ -234,32 +271,52 @@ class Metrics:
     Tracks RPS using a rolling window and computes average flow duration.
     Thread-safe using asyncio.Lock.
     """
+    MAX_FLOW_COUNT = 10_000
+    MAX_RPS_WINDOW = 100_000  # bound deque growth
+    MAX_TOTAL_REQUESTS = 1_000_000_000  # soft cap to avoid unbounded counter growth
+
     def __init__(self):
         self.lock = asyncio.Lock()
-        self.request_timestamps = deque()
+        self.request_timestamps = deque(maxlen=self.MAX_RPS_WINDOW)
         self.last_rps_update_time = 0
         self.last_rps_value = 0.0 # Use float for consistency
+        self.total_requests = 0
+        self._total_requests_resets = 0
 
         # --- For average flow duration ---
         self.flow_duration_sum = 0.0
         self.flow_count = 0
 
     async def increment(self):
-        """Record that a request was made (for RPS)."""
+        """Record that a request was made and refresh cached RPS."""
         now = time.monotonic()
         async with self.lock:
             self.request_timestamps.append(now)
-            # Optimization: Only prune when necessary (e.g., during get_rps) or periodically?
-            # For simplicity, prune here.
             one_second_ago = now - 1.0
             while self.request_timestamps and self.request_timestamps[0] < one_second_ago:
                 self.request_timestamps.popleft()
+            # Soft-cap the counter to avoid unbounded growth; preserve monotonicity by halving when capped.
+            if self.total_requests >= self.MAX_TOTAL_REQUESTS:
+                self.total_requests //= 2
+                self._total_requests_resets += 1
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(f"[Metrics] total_requests soft-reset to {self.total_requests} (resets={self._total_requests_resets})")
+            self.total_requests += 1
+            # Keep snapshot fresh for sync readers (adapter)
+            self.last_rps_value = float(len(self.request_timestamps))
+            self.last_rps_update_time = now
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    f"[Metrics] increment -> window_size={len(self.request_timestamps)}"
+                )
 
     async def get_rps(self) -> float:
         """Return the approximate RPS over the last 1 second."""
         now = time.monotonic()
         # Cache result briefly to avoid excessive lock contention if called rapidly
         if now - self.last_rps_update_time < 0.1:
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"[Metrics] get_rps (cached) -> rps={self.last_rps_value}")
             return self.last_rps_value
 
         async with self.lock:
@@ -271,6 +328,8 @@ class Metrics:
             current_rps = float(len(self.request_timestamps))
             self.last_rps_value = current_rps
             self.last_rps_update_time = now
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(f"[Metrics] get_rps -> rps={current_rps}")
             return current_rps
 
     async def record_flow_duration(self, duration_seconds: float):
@@ -281,6 +340,10 @@ class Metrics:
         async with self.lock:
             self.flow_duration_sum += duration_seconds
             self.flow_count += 1
+            if self.flow_count >= self.MAX_FLOW_COUNT:
+                logger.debug("Resetting flow duration metrics after reaching threshold")
+                self.flow_duration_sum = 0.0
+                self.flow_count = 0
 
     async def get_average_flow_duration_ms(self) -> float:
         """Return the average duration of completed flows in milliseconds."""
@@ -302,6 +365,29 @@ _context_path_regex = re.compile(r'\[(\d+)\]|([a-zA-Z_]\w*)|\.?([a-zA-Z_]\w*)')
 
 # --- Sentinel Object for Missing Keys ---
 _MISSING = object()
+
+# Extra safety: exclude special-use IPv4 ranges even if an address appears global.
+_SPECIAL_USE_IPV4_NETS = (
+    ip_network("0.0.0.0/8"),
+    ip_network("10.0.0.0/8"),
+    ip_network("100.64.0.0/10"),
+    ip_network("127.0.0.0/8"),
+    ip_network("169.254.0.0/16"),
+    ip_network("172.16.0.0/12"),
+    ip_network("192.0.0.0/24"),
+    ip_network("192.0.2.0/24"),
+    ip_network("192.31.196.0/24"),
+    ip_network("192.52.193.0/24"),
+    ip_network("192.88.99.0/24"),
+    ip_network("192.168.0.0/16"),
+    ip_network("192.175.48.0/24"),
+    ip_network("198.18.0.0/15"),
+    ip_network("198.51.100.0/24"),
+    ip_network("203.0.113.0/24"),
+    ip_network("224.0.0.0/4"),
+    ip_network("240.0.0.0/4"),
+    ip_network("255.255.255.255/32"),
+)
 
 def get_value_from_context(context: Dict[str, Any], key: str) -> Any:
     """
@@ -522,6 +608,41 @@ def set_value_in_context(context: Dict[str, Any], key: str, value: Any):
         logger.error(f"Unexpected error setting context key '{key}' at path '{processed_path}': {e}", exc_info=False)
 
 
+def get_header_value_case_insensitive(headers: Dict[str, Any], header_name: str) -> Optional[Any]:
+    """
+    Return the header value for header_name from headers using case-insensitive lookup.
+    """
+    if not headers or not header_name:
+        return None
+    if header_name in headers:
+        return headers.get(header_name)
+    header_name_lower = header_name.lower()
+    for key, value in headers.items():
+        if isinstance(key, str) and key.lower() == header_name_lower:
+            return value
+    return None
+
+
+def validate_public_ipv4(candidate: str) -> tuple[bool, str]:
+    """
+    Validate candidate as a globally routable IPv4 address (not special-use).
+    Returns (is_valid, reason).
+    """
+    if not candidate:
+        return False, "empty"
+    try:
+        addr = ip_address(candidate)
+    except ValueError:
+        return False, "invalid"
+    if getattr(addr, "version", None) != 4:
+        return False, "not_ipv4"
+    if not addr.is_global:
+        return False, "not_global"
+    if any(addr in net for net in _SPECIAL_USE_IPV4_NETS):
+        return False, "special_use"
+    return True, "ok"
+
+
 # ---------------------------
 # Flow Runner Class
 # ---------------------------
@@ -533,14 +654,16 @@ class FlowRunner:
     def __init__(
         self,
         config: ContainerConfig,
-        flowmap: FlowMap,
+        flowmap: Optional[FlowMap],
         metrics: Metrics,
         *,
+        flowmaps: Optional[List[FlowMap]] = None,
         on_iteration_start: Optional[Callable[[int, Dict[str, Any]], Any]] = None,
-        run_once: bool = False,
+        run_once: Optional[bool] = None,
     ):
         self.config = config
-        self.flowmap = flowmap # This should be the validated Pydantic model instance
+        self.flowmaps = flowmaps or ([flowmap] if flowmap else [])
+        self.flowmap = self.flowmaps[0] if self.flowmaps else None
         self.metrics = metrics
         self.running = False # Indicates if the generator should actively run flows
         self.user_tasks: List[asyncio.Task] = []
@@ -549,7 +672,16 @@ class FlowRunner:
         self._active_users_count = 0
         self.lock = asyncio.Lock()  # Lock for managing user_tasks and _active_users_count
         self.on_iteration_start = on_iteration_start
-        self.run_once = run_once
+        self.run_once = run_once if run_once is not None else bool(getattr(self.config, "run_once", False))
+
+        # Mapping of flowmap identity to an asyncio.Lock to prevent concurrent execution of the same flow
+        self._flow_locks: Dict[int, asyncio.Lock] = {id(flow): asyncio.Lock() for flow in self.flowmaps}
+
+        # Queue of flows used when concurrency is disallowed. Acts as a stack
+        # (FILO) so the most recently returned flow is executed first.
+        self._available_flows: deque[FlowMap] = deque()
+        self._flow_assignment_lock = asyncio.Lock()
+        self._refresh_available_flows()
 
         self.configure_logging(self.config.debug)
 
@@ -654,19 +786,39 @@ class FlowRunner:
         self.target_ip = self.config.flow_target_dns_override # Already validated by Pydantic
 
         logger.info(f"Flow Runner Initialized: Target='{self.config.flow_target_url}', Target Sim Users={self.config.sim_users}, DNS Override={self.target_ip or 'None'}, Debug={self.config.debug}")
-        flow_name = getattr(self.flowmap, 'name', 'N/A')
-        num_steps = len(self.flowmap.steps) if self.flowmap and self.flowmap.steps else 0
-        logger.info(f"Flow Loaded: {flow_name} ({num_steps} top-level steps)")
+        if len(self.flowmaps) == 1:
+            flow_name = getattr(self.flowmap, 'name', 'N/A')
+            num_steps = len(self.flowmap.steps) if self.flowmap and self.flowmap.steps else 0
+            logger.info(f"Flow Loaded: {flow_name} ({num_steps} top-level steps)")
+        else:
+            logger.info(f"{len(self.flowmaps)} flowmaps loaded")
 
-    def configure_logging(self, debug: bool):
-        """Configures the logger level based on the debug flag."""
-        log_level = logging.DEBUG if debug else logging.INFO
-        # Configure our specific logger
-        logger.setLevel(log_level)
-        # Also configure handlers attached to our logger
-        for handler in logger.handlers:
-            handler.setLevel(log_level)
-        logger.info(f"Flow Generator logging level set to {logging.getLevelName(log_level)}")
+    def configure_logging(self, debug: bool) -> None:
+        """Configures logger and handler levels based on debug flag."""
+        level = logging.DEBUG if debug else logging.INFO
+        logger.setLevel(level)
+        for h in logger.handlers:
+            h.setLevel(level)
+        logger.debug("Logging configured", extra={"debug": debug})
+
+    async def _trace_on_request_start(self, session: aiohttp.ClientSession, trace_config_ctx: Any, params: Any) -> None:
+        """Trace hook to log headers as aiohttp is about to send the request."""
+        try:
+            raw_headers = params.headers or {}
+            log_headers = {
+                k: ("********" if isinstance(k, str) and k.lower() in ("authorization", "cookie") and v else v)
+                for k, v in raw_headers.items()
+            }
+            logger.debug(f"Trace Send -> {params.method} {params.url} Headers: {log_headers}")
+        except Exception as trace_err:
+            logger.debug(f"Trace hook error (request start): {trace_err}")
+
+    async def _trace_on_request_end(self, session: aiohttp.ClientSession, trace_config_ctx: Any, params: Any) -> None:
+        """Trace hook to log request completion details."""
+        try:
+            logger.debug(f"Trace Done -> {params.method} {params.url} Status: {params.response.status}")
+        except Exception as trace_err:
+            logger.debug(f"Trace hook error (request end): {trace_err}")
 
     def create_aiohttp_connector(self) -> aiohttp.BaseConnector:
         """Creates an aiohttp connector, applying DNS override if configured."""
@@ -725,14 +877,41 @@ class FlowRunner:
             sock_connect=5, # Max time to connect socket (part of connect timeout)
             sock_read=30    # Max time between receiving data chunks
         )
+        trace_configs = []
+        if self.config.debug:
+            trace_config = aiohttp.TraceConfig()
+            trace_config.on_request_start.append(self._trace_on_request_start)
+            trace_config.on_request_end.append(self._trace_on_request_end)
+            trace_configs = [trace_config]
         # Create session WITHOUT cookie jar to ensure user isolation between flow runs
         # Connector lifecycle is managed externally (in simulate_user_lifecycle)
         return aiohttp.ClientSession(
             connector=connector,
             timeout=timeout,
             cookie_jar=None, # Explicitly disable automatic cookie handling per session
-            connector_owner=False # Important: Connector is shared and managed outside
+            connector_owner=False, # Important: Connector is shared and managed outside
+            trace_configs=trace_configs,
         )
+
+    def _refresh_available_flows(self) -> None:
+        """Shuffle and populate the available flow stack."""
+        flows = list(self.flowmaps)
+        random.shuffle(flows)
+        self._available_flows.extend(flows)
+
+    async def _acquire_flow(self) -> Optional[FlowMap]:
+        """Pop the next flow for execution when concurrency is disabled."""
+        while self.running:
+            async with self._flow_assignment_lock:
+                if self._available_flows:
+                    return self._available_flows.pop()
+            await asyncio.sleep(0.01)
+        return None
+
+    async def _release_flow(self, flow: FlowMap) -> None:
+        """Return a flow to the stack after execution."""
+        async with self._flow_assignment_lock:
+            self._available_flows.append(flow)
 
     async def start_generating(self):
         """Start all simulated user tasks and run continuously until stopped."""
@@ -868,11 +1047,20 @@ class FlowRunner:
         # but currently only accessed internally or via control thread which should be safe enough.
         return self._active_users_count
 
-    def _substitute_variables(self, data: Union[str, Dict, List], context: Dict[str, Any]) -> Union[str, Dict, List, Any]:
+    def _substitute_variables(
+        self,
+        data: Union[str, Dict, List],
+        context: Dict[str, Any],
+        for_url: bool = False,
+    ) -> Union[str, Dict, List, Any]:
         """
         Recursively substitutes variables in strings, dict keys/values, or list items.
         Handles {{varName.or[0].path}}, ##VAR:string:varName##, and ##VAR:unquoted:varName## formats.
         Uses the updated get_value_from_context which handles complex paths and returns _MISSING sentinel.
+
+        If ``for_url`` is True, substituted values that do not appear to be full URLs
+        or hostnames are URL-encoded so special characters (e.g. ``&``) are preserved
+        when placed inside query parameters.
         """
         if isinstance(data, str):
             # Special Token Substitution (##VAR:##) - Primarily for body construction
@@ -930,6 +1118,18 @@ class FlowRunner:
                     # Append the literal text before the match
                     result_parts.append(data[last_end:start])
 
+                    # Handle special reserved variable: RANDOM_IP
+                    if var_path == 'RANDOM_IP':
+                        # Generate random IP once per flow run and cache it in context
+                        if '_RANDOM_IP' not in context:
+                            random_ip = self.generate_random_ip()
+                            context['_RANDOM_IP'] = random_ip
+                            logger.debug(f"Generated random IP for flow run: {random_ip}")
+                        value_str = context['_RANDOM_IP']
+                        result_parts.append(value_str)
+                        last_end = end
+                        continue
+
                     # Get the value from context
                     value = get_value_from_context(context, var_path)
 
@@ -941,6 +1141,30 @@ class FlowRunner:
                          value_str = "" # Substitute None as empty string in {{}} context
                     else:
                          value_str = str(value) # Convert other types to string
+
+                    if for_url:
+                        # Avoid encoding full URLs or plain hostnames with optional ports
+                        if not (
+                            '://' in value_str
+                            or re.fullmatch(r"[A-Za-z0-9\.-]+(:\d+)?", value_str)
+                        ):
+                            def _encode_once(candidate: str) -> str:
+                                """
+                                Encode only when needed:
+                                - If already percent-encoded, leave as-is.
+                                - If partially encoded, normalize by decoding then re-encoding once.
+                                - On decode errors, fall back to a single quote() pass.
+                                """
+                                try:
+                                    decoded = unquote(candidate)
+                                    reencoded = quote(decoded, safe='')
+                                    # If decoding/re-encoding yields the same string, it was already properly encoded.
+                                    return candidate if reencoded == candidate else reencoded
+                                except Exception as enc_err:
+                                    logger.debug(f"URL encode fallback for value '{candidate}': {enc_err}")
+                                    return quote(candidate, safe='')
+
+                            value_str = _encode_once(value_str)
 
                     # Append the substituted value string
                     result_parts.append(value_str)
@@ -970,12 +1194,13 @@ class FlowRunner:
             # Note: Substituting keys might have unintended consequences if keys become non-strings.
             # Let's assume keys remain strings after substitution for simplicity.
             return {
-                self._substitute_variables(key, context): self._substitute_variables(val, context)
+                self._substitute_variables(key, context, for_url=for_url):
+                self._substitute_variables(val, context, for_url=for_url)
                 for key, val in data.items()
             }
         elif isinstance(data, list):
             # Recursively substitute in list items
-            return [self._substitute_variables(item, context) for item in data]
+            return [self._substitute_variables(item, context, for_url=for_url) for item in data]
         else:
             # Return non-substitutable types as is (int, float, bool, None, etc.)
             return data
@@ -1301,8 +1526,19 @@ class FlowRunner:
                           logger.warning(f"Invalid extraction path '{path_expr}' for variable '{var_name}'. Needs key after 'body.'.")
                           extracted_value = None
                      else:
-                          # Use get_value_from_context on the response body
                           extracted_value = get_value_from_context(response_data, effective_path)
+                elif path_lower.startswith("body["):
+                     source_description = "body"
+                     effective_path = path_expr[len("body"):]
+                     if not effective_path:
+                          logger.warning(f"Invalid extraction path '{path_expr}' for variable '{var_name}'. Needs index after 'body'.")
+                          extracted_value = None
+                     else:
+                          extracted_value = get_value_from_context(response_data, effective_path)
+                elif path_lower.startswith("["):
+                     source_description = "body"
+                     effective_path = path_expr
+                     extracted_value = get_value_from_context(response_data, effective_path)
                 else:
                      # Default: Assume path refers to the response body
                      # This now correctly handles the literal "status" (not ".status") as a body path
@@ -1330,6 +1566,72 @@ class FlowRunner:
                 # Set context variable to None on unexpected error
                 set_value_in_context(context, var_name, None)
 
+    def _reorder_random_ip_headers(
+        self,
+        final_headers: Dict[str, str],
+        flow_headers: Dict[str, str],
+        context: Dict[str, Any],
+        step_identifier: str,
+    ) -> Dict[str, str]:
+        random_ip = context.get("_RANDOM_IP")
+        if not isinstance(random_ip, str) or not random_ip:
+            return final_headers
+        if not final_headers or not flow_headers:
+            return final_headers
+
+        candidate_keys: List[str] = []
+        for key, value in flow_headers.items():
+            if isinstance(key, str) and isinstance(value, str) and random_ip in value:
+                candidate_keys.append(key)
+
+        if not candidate_keys:
+            return final_headers
+
+        filtered_keys: List[str] = []
+        for key in candidate_keys:
+            if key in final_headers:
+                value = final_headers.get(key)
+                if isinstance(value, str) and random_ip in value:
+                    filtered_keys.append(key)
+
+        if not filtered_keys:
+            return final_headers
+
+        host_key = None
+        connection_key = None
+        content_length_key = None
+        for key in final_headers.keys():
+            if not isinstance(key, str):
+                continue
+            key_lower = key.lower()
+            if host_key is None and key_lower == "host":
+                host_key = key
+            elif connection_key is None and key_lower == "connection":
+                connection_key = key
+            elif content_length_key is None and key_lower == "content-length":
+                content_length_key = key
+            if host_key and connection_key and content_length_key:
+                break
+
+        ordered_keys: List[str] = []
+        for key in (host_key, connection_key, content_length_key):
+            if key and key in final_headers and key not in ordered_keys:
+                ordered_keys.append(key)
+        for key in filtered_keys:
+            if key in final_headers and key not in ordered_keys:
+                ordered_keys.append(key)
+
+        rest_keys = [key for key in final_headers.keys() if key not in ordered_keys]
+        reordered_items = [(key, final_headers[key]) for key in ordered_keys + rest_keys]
+
+        if self.config.debug:
+            logger.debug(
+                f"Step {step_identifier}: Ordered headers (Host -> Connection -> Content-Length -> RANDOM_IP -> rest). "
+                f"RANDOM_IP header(s): {filtered_keys}"
+            )
+
+        return dict(reordered_items)
+
 
     async def _execute_request_step(
         self,
@@ -1354,7 +1656,7 @@ class FlowRunner:
             method = step.method
             # Substitute variables in URL path, step-specific headers, and body
             # Global flow headers are assumed to be already substituted by _execute_steps
-            url_path_substituted = self._substitute_variables(step.url, context)
+            url_path_substituted = self._substitute_variables(step.url, context, for_url=step.urlEncode)
             step_headers_substituted = self._substitute_variables(step.headers or {}, context)
             step_body_substituted = self._substitute_variables(step.body, context) # Handles ##VAR tokens
 
@@ -1500,6 +1802,38 @@ class FlowRunner:
             if host_header_override:
                 final_headers['Host'] = host_header_override # Apply Host override if needed
 
+            # Warn if expected XFF-like header is missing or blank after all overrides
+            xff_header_name = (self.config.xff_header_name or "").strip()
+            if xff_header_name:
+                base_xff = get_header_value_case_insensitive(base_headers, xff_header_name)
+                flow_xff = get_header_value_case_insensitive(flow_headers, xff_header_name)
+                step_xff = None
+                if isinstance(step_headers_substituted, dict):
+                    step_xff = get_header_value_case_insensitive(step_headers_substituted, xff_header_name)
+                final_xff = get_header_value_case_insensitive(final_headers, xff_header_name)
+                if self.config.debug:
+                    logger.debug(
+                        f"Step {step_identifier}: XFF header '{xff_header_name}' values -> "
+                        f"base={base_xff!r}, flow={flow_xff!r}, step={step_xff!r}, final={final_xff!r}"
+                    )
+                if final_xff is None or (isinstance(final_xff, str) and final_xff.strip() == ""):
+                    logger.warning(
+                        f"Step {step_identifier}: Expected header '{xff_header_name}' is missing or empty after merge. "
+                        "Check flow/step headers for overrides or missing substitutions."
+                    )
+                elif isinstance(final_xff, str):
+                    candidate = final_xff.split(",")[0].strip()
+                    is_valid, reason = validate_public_ipv4(candidate)
+                    if not is_valid:
+                        logger.warning(
+                            f"Step {step_identifier}: Header '{xff_header_name}' value '{final_xff}' "
+                            f"is not a valid public IPv4 ({reason})."
+                        )
+                else:
+                    logger.warning(
+                        f"Step {step_identifier}: Header '{xff_header_name}' has non-string value "
+                        f"({type(final_xff).__name__})."
+                    )
 
             # --- Prepare Request Body ---
             data_payload = None
@@ -1536,6 +1870,12 @@ class FlowRunner:
                     logger.warning(f"Step {step_identifier}: Unsupported body type after substitution: {type(step_body_substituted)}. Sending as string representation.")
                     data_payload = str(step_body_substituted).encode('utf-8', errors='replace')
 
+            final_headers = self._reorder_random_ip_headers(
+                final_headers,
+                flow_headers,
+                context,
+                step_identifier,
+            )
 
             if logger.isEnabledFor(logging.DEBUG):
                 log_headers = {k: ('********' if isinstance(v, str) and (k.lower() == 'authorization' or k.lower() == 'cookie') and v else v) for k, v in final_headers.items()}
@@ -2011,239 +2351,208 @@ class FlowRunner:
 
 
     async def simulate_user_lifecycle(self, user_id: int):
-        """
-        Manages the continuous lifecycle of a single simulated user task.
-        Includes setup, flow execution loop, rest periods, and cleanup.
-        """
+        """Execute each flowmap exactly once for a single simulated user."""
         user_log_prefix = f"User {user_id}"
-        connector = None # Initialize connector reference
-        flow_iteration = 0
+        connector = None
 
-        try: # Top-level try/finally for reliable active user count decrement
-            # --- Task Startup ---
-            async with self.lock: # Protect counter increment
+        try:
+            async with self.lock:
                 self._active_users_count += 1
-            flow_name_log = getattr(self.flowmap, 'name', 'N/A')
-            logger.info(f"{user_log_prefix}: Task started for flow '{flow_name_log}'. Active users: {self._active_users_count}")
+            logger.info(f"{user_log_prefix}: Task started for {len(self.flowmaps)} flow(s). Active users: {self._active_users_count}")
 
-            # Create connector once for the lifetime of this user task (allows connection pooling)
             connector = self.create_aiohttp_connector()
 
-            # --- Main Loop ---
+            overall_flow_iteration = 0
             while self.running:
-                flow_iteration += 1
-                flow_instance_start_time = time.monotonic()
-                flow_epoch_start_time = time.time()  # Wall clock time
-
-                # --- Generate Per-Flow State ---
-                fake_ip = self.generate_random_ip()
-                is_web_like = random.choice([True, False])
-                # Ensure random.choice returns a dict before calling .copy()
-                chosen_headers_template = random.choice(self.headers_web_options if is_web_like else self.headers_api_options)
-                if not isinstance(chosen_headers_template, dict):
-                    logger.error(f"{user_log_prefix} (Iter {flow_iteration}): Invalid header template found: {chosen_headers_template}. Using empty headers.")
-                    base_session_headers = {}
+                if self.config.allow_flow_concurrency:
+                    flows = list(self.flowmaps)
+                    random.shuffle(flows)
                 else:
-                    base_session_headers = chosen_headers_template.copy()
+                    flow = await self._acquire_flow()
+                    if flow is None:
+                        await asyncio.sleep(0.01)
+                        continue
+                    flows = [flow]
+                executed_any = False
 
-                chosen_ua_template = random.choice(self.user_agents_web if is_web_like else self.user_agents_api)
-                if not isinstance(chosen_ua_template, str):
-                     logger.error(f"{user_log_prefix} (Iter {flow_iteration}): Invalid user agent template found: {chosen_ua_template}. Using default UA.")
-                     ua = "FlowRunner/1.0" # Default fallback UA
-                else:
-                     ua = chosen_ua_template
-                base_session_headers["User-Agent"] = ua
+                for flow_iteration, flow in enumerate(flows, start=1):
+                    if not self.running:
+                        break
+                    executed_any = True
+                    overall_flow_iteration += 1
+                    flow_instance_start_time = time.monotonic()
+                    flow_epoch_start_time = time.time()
 
-                if self.config.xff_header_name:
-                    base_session_headers[self.config.xff_header_name] = fake_ip
-                logger.debug(f"{user_log_prefix} (Iter {flow_iteration}): New session state (IP: {fake_ip}, UA: {ua[:30]}..., Profile: {'Web' if is_web_like else 'API'})")
-
-                # --- Initialize Context for this Flow Instance ---
-                context = {
-                    "userId": user_id,
-                    "userFakeIp": fake_ip,
-                    "flowInstance": flow_iteration,
-                    "flowStartTimeEpoch": flow_epoch_start_time,
-                    "flow_error": None # Initialize error state explicitly
-                }
-                # Add static variables (use deepcopy for isolation)
-                static_vars = getattr(self.flowmap, 'staticVars', {})
-                if static_vars:
-                    try: context.update(copy.deepcopy(static_vars))
-                    except Exception as copy_err:
-                         logger.warning(f"{user_log_prefix} (Iter {flow_iteration}): Could not deepcopy staticVars: {copy_err}. Using shallow copy.")
-                         context.update(static_vars)
-
-                # Get global flow headers definition (unsubstituted)
-                global_flow_headers_def = getattr(self.flowmap, 'headers', {}) or {}
-
-                if self.on_iteration_start and flow_iteration > 1:
-                    logger.debug(
-                        f"Calling on_iteration_start callback for iteration {flow_iteration} with context keys: {list(context.keys())}"
+                    fake_ip = self.generate_random_ip()
+                    is_web_like = random.choice([True, False])
+                    chosen_headers_template = random.choice(
+                        self.headers_web_options if is_web_like else self.headers_api_options
                     )
-                    try:
-                        self.on_iteration_start(flow_iteration, context)
-                    except Exception as cb_err:
+                    if not isinstance(chosen_headers_template, dict):
                         logger.error(
-                            f"Error during on_iteration_start callback for iteration {flow_iteration}: {cb_err}"
+                            f"{user_log_prefix} (Flow {flow_iteration}): Invalid header template found: {chosen_headers_template}. Using empty headers."
+                        )
+                        base_session_headers = {}
+                    else:
+                        base_session_headers = chosen_headers_template.copy()
+
+                    ua_template = random.choice(
+                        self.user_agents_web if is_web_like else self.user_agents_api
+                    )
+                    ua = ua_template if isinstance(ua_template, str) else "FlowRunner/1.0"
+                    base_session_headers["User-Agent"] = ua
+                    if self.config.xff_header_name:
+                        base_session_headers[self.config.xff_header_name] = fake_ip
+                    logger.debug(
+                        f"{user_log_prefix} (Flow {flow_iteration}): New session state (IP: {fake_ip}, UA: {ua[:30]}..., Profile: {'Web' if is_web_like else 'API'})"
+                    )
+
+                    context = {
+                        "userId": user_id,
+                        "userFakeIp": fake_ip,
+                        "flowInstance": overall_flow_iteration,
+                        "flowStartTimeEpoch": flow_epoch_start_time,
+                        "flow_error": None,
+                    }
+                    static_vars = getattr(flow, 'staticVars', {})
+                    if static_vars:
+                        try:
+                            context.update(copy.deepcopy(static_vars))
+                        except Exception as copy_err:
+                            logger.warning(
+                                f"{user_log_prefix} (Flow {flow_iteration}): Could not deepcopy staticVars: {copy_err}. Using shallow copy."
+                            )
+                            context.update(static_vars)
+
+                    if self.on_iteration_start and overall_flow_iteration > 1:
+                        try:
+                            self.on_iteration_start(overall_flow_iteration, context.copy())
+                        except Exception as cb_err:
+                            logger.warning(
+                                f"{user_log_prefix} (Flow {overall_flow_iteration}): on_iteration_start callback error: {cb_err}"
+                            )
+
+                    global_flow_headers_def = getattr(flow, 'headers', {}) or {}
+
+                    session = None
+                    flow_completed_successfully = False
+                    try:
+                        session = self.create_session(connector)
+                        flow_name_log = getattr(flow, 'name', 'N/A')
+                        logger.info(f"{user_log_prefix} (Flow {flow_iteration}): Starting flow '{flow_name_log}'.")
+
+                        await self._execute_steps(
+                            steps=flow.steps,
+                            session=session,
+                            base_headers=base_session_headers,
+                            flow_headers=global_flow_headers_def,
+                            context=context,
+                            depth=0,
                         )
 
-                # --- Execute Flow within a Session ---
-                session = None
-                flow_completed_successfully = False # Track if flow finished without internal errors
-                try: # Ensure session is always closed after one flow iteration
-                    session = self.create_session(connector)
-                    logger.info(f"{user_log_prefix} (Iter {flow_iteration}): Starting flow instance.")
+                        final_flow_error_val = get_value_from_context(context, 'flow_error')
+                        if final_flow_error_val is _MISSING or final_flow_error_val is None:
+                            flow_completed_successfully = True
+                        else:
+                            logger.warning(f"{user_log_prefix} (Flow {flow_iteration}): Flow finished with error: {final_flow_error_val}")
 
-                    # Execute the top-level steps (pass the list of models/dicts)
-                    await self._execute_steps(
-                        steps=self.flowmap.steps,
-                        session=session,
-                        base_headers=base_session_headers,
-                        flow_headers=global_flow_headers_def, # Pass definition, substitution happens inside
-                        context=context,
-                        depth=0
-                    )
-
-                    # Check final error state in context
-                    final_flow_error_val = get_value_from_context(context, 'flow_error')
-                    if final_flow_error_val is _MISSING or final_flow_error_val is None:
-                        flow_completed_successfully = True
-                    else:
-                         logger.warning(f"{user_log_prefix} (Iter {flow_iteration}): Flow instance finished with error: {final_flow_error_val}")
-
-
-                except asyncio.CancelledError:
-                    logger.info(f"{user_log_prefix} (Iter {flow_iteration}): Flow instance cancelled during execution.")
-                    self.running = False # Ensure loop terminates
-                    # Do not re-raise, let finally close session and outer loop check self.running
-                except Exception as e:
-                    logger.error(f"{user_log_prefix} (Iter {flow_iteration}): Unhandled error during flow execution block: {e}", exc_info=self.config.debug)
-                    # Record error state, flow did not complete successfully
-                    set_value_in_context(context, 'flow_error', f"Unhandled flow error: {e}")
-                    # flow_completed_successfully remains False
-
-                finally:
-                    # --- Cleanup Session for this Iteration ---
-                    if session and not session.closed:
-                        await session.close()
-                        logger.debug(f"{user_log_prefix} (Iter {flow_iteration}): Session closed.")
-
-                    # --- Record Metrics and Log Duration ---
-                    flow_instance_end_time = time.monotonic()
-                    flow_duration = flow_instance_end_time - flow_instance_start_time
-
-                    # Record duration only if flow completed without internal errors and runner is still running
-                    if flow_completed_successfully and self.running:
-                        await self.metrics.record_flow_duration(flow_duration)
-                        logger.info(f"{user_log_prefix} (Iter {flow_iteration}): Flow instance finished successfully in {flow_duration:.3f} seconds.")
-                    elif not self.running:
-                         logger.info(f"{user_log_prefix} (Iter {flow_iteration}): Flow instance ended (stopped/cancelled) after {flow_duration:.3f} seconds.")
-                    # else: Error already logged
-
-
-                # --- Inter-Flow Rest Period ---
-                if self.running:
-                    if self.run_once:
-                        logger.info(f"{user_log_prefix}: run_once enabled - stopping after first iteration.")
-                        self.running = False
-                        if hasattr(self, '_stopped_event') and self._stopped_event and not self._stopped_event.is_set():
-                            self._stopped_event.set()
-                        break
-                    if self.config.flow_cycle_delay_ms is not None:
-                        rest_duration_s = max(self.config.flow_cycle_delay_ms / 1000.0, 0.001)
-                    else:
-                        min_rest_s = self.config.min_sleep_ms / 1000.0
-                        max_rest_s = self.config.max_sleep_ms / 1000.0
-                        if min_rest_s > max_rest_s:
-                            min_rest_s = max_rest_s
-                        rest_duration_s = random.uniform(min_rest_s, max_rest_s)
-                        if rest_duration_s <= 0.001:
-                            rest_duration_s = 0.001
-
-                    logger.info(
-                        f"{user_log_prefix}: Flow iteration {flow_iteration} complete, next in {rest_duration_s:.2f}s"
-                    )
-                    try:
-                        await asyncio.sleep(rest_duration_s)
                     except asyncio.CancelledError:
-                         logger.info(f"{user_log_prefix}: Task cancelled during rest period.")
-                         self.running = False # Ensure loop terminates
+                        logger.info(f"{user_log_prefix} (Flow {flow_iteration}): Flow instance cancelled during execution.")
+                        self.running = False
+                    except Exception as e:
+                        logger.error(f"{user_log_prefix} (Flow {flow_iteration}): Unhandled error during flow execution block: {e}", exc_info=self.config.debug)
+                        set_value_in_context(context, 'flow_error', f"Unhandled flow error: {e}")
+                    finally:
+                        if session and not session.closed:
+                            await session.close()
+                            logger.debug(f"{user_log_prefix} (Flow {flow_iteration}): Session closed.")
+                        if not self.config.allow_flow_concurrency:
+                            await self._release_flow(flow)
 
-            # --- End of Main While Loop (self.running is False or task cancelled) ---
+                        flow_instance_end_time = time.monotonic()
+                        flow_duration = flow_instance_end_time - flow_instance_start_time
+                        if flow_completed_successfully and self.running:
+                            await self.metrics.record_flow_duration(flow_duration)
+                            logger.info(f"{user_log_prefix} (Flow {flow_iteration}): Flow finished successfully in {flow_duration:.3f} seconds.")
+                        elif not self.running:
+                            logger.info(f"{user_log_prefix} (Flow {flow_iteration}): Flow ended after {flow_duration:.3f} seconds (stopped/cancelled).")
+
+                        if self.running:
+                            if self.config.flow_cycle_delay_ms is not None:
+                                rest_duration_s = max(self.config.flow_cycle_delay_ms / 1000.0, 0.001)
+                            else:
+                                min_rest_s = self.config.min_sleep_ms / 1000.0
+                                max_rest_s = self.config.max_sleep_ms / 1000.0
+                                if min_rest_s > max_rest_s:
+                                    min_rest_s = max_rest_s
+                                rest_duration_s = random.uniform(min_rest_s, max_rest_s)
+                                if rest_duration_s <= 0.001:
+                                    rest_duration_s = 0.001
+                            logger.info(f"{user_log_prefix}: Next flow in {rest_duration_s:.2f}s")
+                            try:
+                                await asyncio.sleep(rest_duration_s)
+                            except asyncio.CancelledError:
+                                logger.info(f"{user_log_prefix}: Task cancelled during rest period.")
+                                self.running = False
+                                break
+
+                if self.run_once:
+                    logger.info(f"{user_log_prefix}: run_once enabled; stopping after first flow cycle.")
+                    break
+
+                if not executed_any and self.running:
+                    await asyncio.sleep(0.01)
 
         except asyncio.CancelledError:
-            # Catch cancellation signal targeting the task itself (e.g., from stop_running)
             logger.info(f"{user_log_prefix}: Task received cancellation signal.")
-            self.running = False # Ensure state consistency
-
+            self.running = False
         except Exception as e:
-             # Catch unexpected errors in the main loop structure or connector setup/cleanup
             logger.critical(f"{user_log_prefix}: Task exiting due to unhandled outer error: {e}", exc_info=True)
-            self.running = False # Ensure state consistency
-
+            self.running = False
         finally:
-            # --- Task Cleanup ---
             logger.info(f"{user_log_prefix}: Task stopping.")
-            # Decrement active user count reliably
-            async with self.lock: # Protect counter decrement
+            async with self.lock:
                 if self._active_users_count > 0:
                     self._active_users_count -= 1
                 else:
                     logger.warning(f"{user_log_prefix}: Task exiting, but active user count was already {self._active_users_count}.")
+                last_user = self._active_users_count == 0
 
-            # --- Cleanup Connector ---
             if connector and not connector.closed:
                 logger.debug(f"{user_log_prefix}: Closing user task connector.")
                 try:
-                    # Use timeout for connector closing to prevent hangs
                     await asyncio.wait_for(connector.close(), timeout=5.0)
                     logger.debug(f"{user_log_prefix}: User task connector closed.")
                 except asyncio.TimeoutError:
-                     logger.warning(f"{user_log_prefix}: Timeout closing user task connector.")
+                    logger.warning(f"{user_log_prefix}: Timeout closing user task connector.")
                 except Exception as conn_close_err:
-                     logger.error(f"{user_log_prefix}: Error closing user task connector: {conn_close_err}")
+                    logger.error(f"{user_log_prefix}: Error closing user task connector: {conn_close_err}")
             elif connector:
-                 logger.debug(f"{user_log_prefix}: Connector was already closed.")
+                logger.debug(f"{user_log_prefix}: Connector was already closed.")
+
+            if last_user:
+                self.running = False
+                if self._stopped_event and not self._stopped_event.is_set():
+                    self._stopped_event.set()
 
             logger.info(f"{user_log_prefix}: Task finished cleanup. Final active users: {self._active_users_count}")
 
 
     def generate_random_ip(self) -> str:
-        """Generates a random, plausible public IPv4 address string, avoiding reserved/special ranges."""
-        # Use existing implementation (seems reasonable)
+        """Generates a random, globally routable public IPv4 address string."""
         while True:
-            octets = [random.randint(1, 223)] + [random.randint(0, 255) for _ in range(3)]
-
-            # Quick checks for common private ranges
-            if octets[0] == 10: continue # 10.0.0.0/8
-            if octets[0] == 127: continue # 127.0.0.0/8 (Loopback)
-            if octets[0] == 172 and 16 <= octets[1] <= 31: continue # 172.16.0.0/12
-            if octets[0] == 192 and octets[1] == 168: continue # 192.168.0.0/16
-
-            # Check other reserved ranges (can be simplified/combined)
-            if octets[0] == 0: continue # 0.0.0.0/8 (Current network)
-            if octets[0] == 100 and 64 <= octets[1] <= 127: continue # 100.64.0.0/10 (Shared Address Space)
-            if octets[0] == 169 and octets[1] == 254: continue # 169.254.0.0/16 (Link-local)
-            if octets[0] == 192 and octets[1] == 0 and octets[2] == 0: continue # 192.0.0.0/24 (IETF Assignment)
-            if octets[0] == 192 and octets[1] == 0 and octets[2] == 2: continue # 192.0.2.0/24 (TEST-NET-1)
-            if octets[0] == 192 and octets[1] == 88 and octets[2] == 99: continue # 192.88.99.0/24 (6to4 Relay)
-            if octets[0] == 198 and 18 <= octets[1] <= 19: continue # 198.18.0.0/15 (Benchmark Testing)
-            if octets[0] == 198 and octets[1] == 51 and octets[2] == 100: continue # 198.51.100.0/24 (TEST-NET-2)
-            if octets[0] == 203 and octets[1] == 0 and octets[2] == 113: continue # 203.0.113.0/24 (TEST-NET-3)
-            # Skip multicast (224.0.0.0 to 239.255.255.255) - covered by first octet < 224
-            # Skip Broadcast (255.255.255.255) - covered by first octet < 224
-
-            ip_str = f"{octets[0]}.{octets[1]}.{octets[2]}.{octets[3]}"
-
-            # Final check using ipaddress module flags (optional belt-and-suspenders)
-            # try:
-            #     addr = ip_address(ip_str)
-            #     if addr.is_private or addr.is_reserved or addr.is_loopback or addr.is_link_local or addr.is_multicast:
-            #         continue # Should be caught by checks above
-            # except ValueError: continue # Should not happen
-
-            return ip_str
+            candidate_int = random.getrandbits(32)
+            try:
+                addr = ip_address(candidate_int)
+            except ValueError:
+                continue
+            if getattr(addr, "version", None) != 4:
+                continue
+            if not addr.is_global:
+                continue
+            if any(addr in net for net in _SPECIAL_USE_IPV4_NETS):
+                continue
+            return str(addr)
 
 
 # --- Final Pydantic Model Rebuild ---

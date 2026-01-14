@@ -8,7 +8,18 @@
 
 FlowRunner is a powerful, UI-less engine designed for the automated execution of API call sequences, known as "flows." It operates within a Docker container and is managed via a simple HTTP API. This component is a core part of the **ShowRunner** orchestration platform, enabling continuous, repeatable execution of complex API interactions for purposes such as:
 
-*   **Automated Legitimate Traffic Generation:** Simulate realistic user and application behavior against target systems.
+*   **Automated Legitimate Traffic Generjq -n --argfile flow ivy.flow.json \
+  '{
+    config: {
+      flow_target_url: "https://bla-secure.ase-team.com",
+      sim_users: 1,
+      override_step_url_host: false
+    },
+    flowmap: $flow
+  }' \
+| curl -X POST http://localhost:8081/api/start \
+    -H "Content-Type: application/json" \
+    -d @-ation:** Simulate realistic user and application behavior against target systems.
 *   **API Health & Endpoint Monitoring:** Continuously verify the availability and correctness of API endpoints.
 *   **API Integration Testing:** Run sequences of API calls to test multi-step processes.
 *   **Security Testing Support:** Execute predefined flows to probe for vulnerabilities or validate security controls under load.
@@ -24,11 +35,13 @@ FlowRunner is designed to execute flows exported from a companion graphical flow
     *   **Static Variables:** Define global key-value pairs for a flow run.
     *   **Dynamic Extraction:** Extract status codes, headers, and body values (including implicit `body.` paths) into variables.
     *   **Substitution:** Use `{{variableName}}` syntax in URLs, headers, and request bodies. `##VAR:string:name##` and `##VAR:unquoted:name##` allow precise JSON value injection.
+    *   **Special Variables:** The `{{RANDOM_IP}}` variable generates a random public IPv4 address once per flow run. The IP remains consistent throughout all steps in a single flow execution cycle, making it ideal for headers like `X-Forwarded-For` or `X-Real-IP`. The IP is regenerated for each new flow cycle.
 *   **URL Handling:**
     *   **Global Target URL:** Configure a primary base URL for all flow operations.
     *   **DNS Override:** Optionally override DNS resolution for the global target URL.
     *   **Override Step URL Host:** By default the host of every request comes from `flow_target_url`, with the step providing only path/query. Disable with `override_step_url_host: false`.
     *   **Flow Cycle Delay:** Optionally specify a fixed wait time between flow iterations via `flow_cycle_delay_ms`.
+    *   **URL Encoding:** Variable substitutions in step URLs are URL‑encoded by default to preserve special characters. Set `urlEncode: false` on a request step to skip encoding.
 *   **Context Management:**
     *   Maintains an execution context that evolves as the flow progresses.
     *   Ensures context isolation for loop iterations.
@@ -36,9 +49,9 @@ FlowRunner is designed to execute flows exported from a companion graphical flow
     *   Randomized source IP injection (via configurable header, e.g., `X-Forwarded-For`).
     *   Rotation of common `User-Agent` strings and other HTTP headers to mimic diverse clients.
 *   **Control API (`container_control.py`):**
-    *   Simple HTTP API for starting, stopping, and monitoring flow execution (always continuous when started).
+    *   Simple HTTP API for starting, stopping, and monitoring flow execution (continuous by default, with an optional run-once toggle).
     *   Endpoints for health checks and detailed metrics (JSON and Prometheus formats).
-*   **Continuous Operation:** Flows automatically repeat until a stop request is issued.
+*   **Continuous Operation:** Flows automatically repeat until a stop request is issued. When the `run_once` flag is provided at start time, the runner completes a single iteration and then shuts down.
 *   **Resource Management:**
     *   Configurable memory limits for the container process to prevent run-away resource consumption.
 
@@ -53,7 +66,7 @@ The FlowRunner system consists of two main Python files typically run within a D
 2.  **`container_control.py`:**
     *   Provides a FastAPI-based HTTP API to manage and interact with the `FlowRunner` instance.
     *   Endpoints:
-        *   `/api/start`: To initiate flow execution with a given configuration and flowmap.
+        *   `/api/start`: To initiate flow execution with a given configuration and flowmap or flowmaps.
         *   `/api/stop`: To immediately halt any ongoing flow execution.
         *   `/api/health`: Basic health check.
         *   `/api/metrics`: Detailed operational metrics in JSON format.
@@ -66,7 +79,7 @@ All endpoints are prefixed with `/api` unless otherwise noted.
 
 ### 4.1. `POST /api/start`
 
-Starts (or restarts) the FlowRunner with the provided configuration and flowmap. If a flow is already running, it will be forcibly stopped before the new one begins.
+Starts (or restarts) the FlowRunner with the provided configuration and flowmap(s). If a flow is already running, it will be forcibly stopped before the new one begins.
 
 **Request Body (JSON):**
 
@@ -85,11 +98,17 @@ Starts (or restarts) the FlowRunner with the provided configuration and flowmap.
     "debug": "boolean (default: false, enables verbose logging)"
     "override_step_url_host": "boolean (default: true, ignore host in step URLs)"
     "flow_cycle_delay_ms": "integer (optional, fixed ms wait between flow cycles)"
+    "run_once": "boolean (optional; when true the flow(s) run once, then the runner signals container shutdown)"
     // Any other fields defined in ContainerConfig Pydantic model
   },
   "flowmap": {
-    // JSON object representing the flow definition. See Section 5 for FlowMap structure.
+    // JSON object representing a single flow definition
   }
+  // or
+  "flowmaps": [
+    { /* first flow */ },
+    { /* second flow */ }
+  ]
 }
 ```
 
@@ -330,20 +349,75 @@ Refer to the provided `Dockerfile` and `requirements.txt`.
 
 1.  **Build the Docker Image:**
     ```bash
-    docker build -t flowrunner-engine:1.1.3 .
+    docker build -t flowrunner-engine:1.1.4 .
     ```
 2.  **Run the Container:**
     ```bash
-    docker run -d -p 8080:8080 --name my-flowrunner flowrunner-engine:1.1.3
+    docker run -d -p 8080:8080 --name my-flowrunner flowrunner-engine:1.1.4
     ```
     *   The API will be available on `http://localhost:8080`.
     *   Consider volume mounting for persistent configurations or logs if needed.
 
-3.  **Interact with the API:**
-    *   Use `curl` or any HTTP client (like Postman) to send requests to the `/api/start`, `/api/stop`, etc. endpoints.
-    *   Example: Start a flow (assuming `my_flow.json` contains the full request body structure shown in Section 4.1):
+3.  **Interact with the API:** Use `curl` or any HTTP client (like Postman) to send requests to `/api/start`, `/api/stop`, etc. Below are runnable `curl`/`jq` examples.
+    *   **Example A: Pre-wrapped payload (file already contains `{config, flowmap}`):**
         ```bash
-        curl -X POST -H "Content-Type: application/json" -d @my_flow.json http://localhost:8080/api/start
+        curl -X POST -H "Content-Type: application/json" \
+          -d @my_flow_request.json \
+          http://localhost:8080/api/start
+        ```
+    *   **Example B: Wrap a single flow file on the fly (step URLs use host from `flow_target_url`):**
+        ```bash
+        jq -n --argfile flow my_flow.json '
+        {
+          config: {
+            flow_target_url: "https://api.example.com",
+            sim_users: 1,
+            override_step_url_host: true
+          },
+          flowmap: $flow
+        }' | curl -X POST -H "Content-Type: application/json" -d @- http://localhost:8080/api/start
+        ```
+    *   **Example C: Respect absolute step URLs (do not override host/scheme in the flow):**
+        ```bash
+        jq -n --argfile flow my_flow.json '
+        {
+          config: {
+            flow_target_url: "https://api.example.com",  # still used for relative URLs
+            override_step_url_host: false,
+            sim_users: 2
+          },
+          flowmap: $flow
+        }' | curl -X POST -H "Content-Type: application/json" -d @- http://localhost:8080/api/start
+        ```
+    *   **Example D: Add extra config knobs (DNS override, delays, debug):**
+        ```bash
+        jq -n --argfile flow my_flow.json '
+        {
+          config: {
+            flow_target_url: "https://api.example.com",
+            flow_target_dns_override: "203.0.113.10",
+            override_step_url_host: true,
+            sim_users: 3,
+            min_sleep_ms: 50,
+            max_sleep_ms: 150,
+            flow_cycle_delay_ms: 500,
+            debug: true
+          },
+          flowmap: $flow
+        }' | curl -X POST -H "Content-Type: application/json" -d @- http://localhost:8080/api/start
+        ```
+    *   **Example E: Multi-flow payload (round-robin when `allow_flow_concurrency=true`):**
+        ```bash
+        jq -n --argfile flowA flow_a.json --argfile flowB flow_b.json '
+        {
+          config: {
+            flow_target_url: "https://api.example.com",
+            sim_users: 4,
+            allow_flow_concurrency: true,
+            override_step_url_host: true
+          },
+          flowmaps: [$flowA, $flowB]
+        }' | curl -X POST -H "Content-Type: application/json" -d @- http://localhost:8080/api/start
         ```
 
 ## 7. Local Development / Testing
@@ -375,6 +449,34 @@ Stop with `Ctrl+C` when finished.
 *   **Flow Not Behaving as Expected:**
     *   Enable debug logging (`"debug": true` in `/api/start` config) and inspect the detailed logs from `flow_runner.py`.
     *   Check variable substitutions: Are variables resolving to the expected values?
+    *   **{{RANDOM_IP}} Example:** Use the special `{{RANDOM_IP}}` variable to simulate requests from different source IPs:
+        ```json
+        {
+          "name": "IP Rotation Flow",
+          "steps": [
+            {
+              "id": "step1",
+              "type": "request",
+              "method": "GET",
+              "url": "/api/endpoint",
+              "headers": {
+                "X-Forwarded-For": "{{RANDOM_IP}}",
+                "X-Real-IP": "{{RANDOM_IP}}"
+              }
+            },
+            {
+              "id": "step2",
+              "type": "request",
+              "method": "POST",
+              "url": "/api/submit?source={{RANDOM_IP}}",
+              "headers": {
+                "X-Client-IP": "{{RANDOM_IP}}"
+              }
+            }
+          ]
+        }
+        ```
+        In this example, the same random IP is used across all steps in a single flow execution cycle. When the flow repeats (new cycle), a different random IP is generated.
     *   Verify conditional logic: Is the `conditionData` correct and evaluating as intended?
     *   Inspect loop sources: Is the `source` variable resolving to a valid list?
     *   Examine extraction rules: Are paths correct? Are there extraction failure warnings in logs or metrics?
@@ -390,4 +492,3 @@ Stop with `Ctrl+C` when finished.
 
 *   **Dependencies:** See `requirements.txt`.
 *   **Testing:** A comprehensive test suite should be maintained (details in a separate test plan document).
-
