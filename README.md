@@ -1,7 +1,7 @@
 
 # FlowRunner (Automated API Flow Execution Engine)
 
-**Version:** 1.1.3
+**Version:** 1.2.0
 **Status:** Stable
 
 ## 1. Overview
@@ -26,16 +26,19 @@ FlowRunner is a powerful, UI-less engine designed for the automated execution of
 
 FlowRunner is designed to execute flows exported from a companion graphical flow authoring application, ensuring consistency between flow design and automated execution.
 
-## 2. Key Features (Version 1.1.3)
+## 2. Key Features (Version 1.2.0)
 
 *   **Flow Execution:**
     *   Runs multi-step API flows defined in a JSON format.
-    *   Supports **Request Steps** (GET, POST, PUT, PATCH, DELETE, etc.), **Condition Steps** (if/then/else), and **Loop Steps** (for-each).
+    *   Supports **Request Steps** (GET, POST, PUT, PATCH, DELETE, etc.), **Condition Steps** (if/then/else), **Loop Steps** (for-each), and **Transform Steps** (ordered data operations).
 *   **Variable Management:**
     *   **Static Variables:** Define global key-value pairs for a flow run.
     *   **Dynamic Extraction:** Extract status codes, headers, and body values (including implicit `body.` paths) into variables.
     *   **Substitution:** Use `{{variableName}}` syntax in URLs, headers, and request bodies. `##VAR:string:name##` and `##VAR:unquoted:name##` allow precise JSON value injection.
-    *   **Special Variables:** The `{{RANDOM_IP}}` variable generates a random public IPv4 address once per flow run. The IP remains consistent throughout all steps in a single flow execution cycle, making it ideal for headers like `X-Forwarded-For` or `X-Real-IP`. The IP is regenerated for each new flow cycle.
+    *   **Special Variables:** Generated once per flow iteration and cached for the run.
+        *   `{{RANDOM_IP}}`: Random public IPv4 address (stable during a single flow iteration).
+        *   `{{RANDOM_INT}}` / `{{RANDOM_INT(min,max)}}`: Random integer (default range 0–1000000).
+        *   `{{RANDOM_STRING}}` / `{{RANDOM_STRING(length)}}`: Random alphanumeric string (default length 12).
 *   **URL Handling:**
     *   **Global Target URL:** Configure a primary base URL for all flow operations.
     *   **DNS Override:** Optionally override DNS resolution for the global target URL.
@@ -327,7 +330,30 @@ Defines iteration over a list.
 
 *   Inside the loop `steps`, `{{loopVariable}}` (e.g., `{{item}}`) and `{{loopVariable_index}}` will be available in the context.
 
-### 5.3. URL Construction Logic (Version 1.1.3 Behavior)
+#### 5.2.4. `type: "transform"`
+
+Defines ordered data transformations that write results into the context.
+
+```json
+{
+  "id": "string",
+  "name": "string (optional)",
+  "type": "transform",
+  "ops": [
+    {
+      "op": "string (e.g., math_add, json_set, base64_encode)",
+      "set": "string (context variable name to store result)",
+      "args": [ /* optional positional arguments */ ],
+      "options": { /* optional op-specific options */ }
+    }
+  ]
+}
+```
+
+*   **Supported ops:** `base64_encode`, `base64_decode`, `jwt_encode`, `jwt_decode`, `json_set`, `math_add`, `math_sub`, `math_mul`, `math_div`, `to_number`, `to_string`, `to_boolean`, `boolean_not`.
+*   **References:** Use `{ "ref": "path.to.value" }` or `"{{path.to.value}}"` inside `args`/`options` to pull from context.
+
+### 5.3. URL Construction Logic (Version 1.2.0 Behavior)
 
 The final URL for each Request step depends on `override_step_url_host`:
 
@@ -341,7 +367,7 @@ The final URL for each Request step depends on `override_step_url_host`:
     *   If it is relative, it is appended to `flow_target_url`.
 4.  **DNS Override:** When `flow_target_dns_override` is set, requests are directed to that IP while the `Host` header reflects the original hostname.
 
-**URL Override Update (v1.1.3):** `config.override_step_url_host` now controls how final request URLs are built. When `true` (default) the scheme/host/port come exclusively from `flow_target_url` and the step only provides the path/query. Set to `false` to allow absolute step URLs as in v1.0.0.
+**URL Override Update (v1.2.0):** `config.override_step_url_host` controls how final request URLs are built. When `true` (default) the scheme/host/port come exclusively from `flow_target_url` and the step only provides the path/query. Set to `false` to allow absolute step URLs as in v1.0.0.
 
 ## 6. Deployment & Usage (Docker)
 
@@ -349,11 +375,15 @@ Refer to the provided `Dockerfile` and `requirements.txt`.
 
 1.  **Build the Docker Image:**
     ```bash
-    docker build -t flowrunner-engine:1.1.4 .
+    docker build -t flowrunner-engine:1.2.0 .
     ```
 2.  **Run the Container:**
     ```bash
-    docker run -d -p 8080:8080 --name my-flowrunner flowrunner-engine:1.1.4
+    docker run -d -p 8080:8080 --name my-flowrunner flowrunner-engine:1.2.0
+    ```
+3.  **Prebuilt Image (Recommended):**
+    ```bash
+    docker run -d -p 8080:8080 --name my-flowrunner razor29/flowrunner-cli:v1.2.0
     ```
     *   The API will be available on `http://localhost:8080`.
     *   Consider volume mounting for persistent configurations or logs if needed.
@@ -477,6 +507,7 @@ Stop with `Ctrl+C` when finished.
         }
         ```
         In this example, the same random IP is used across all steps in a single flow execution cycle. When the flow repeats (new cycle), a different random IP is generated.
+    *   **Randomized Values:** Use `{{RANDOM_INT(min,max)}}` and `{{RANDOM_STRING(length)}}` in URLs, headers, or JSON bodies to generate stable-per-iteration randomized values.
     *   Verify conditional logic: Is the `conditionData` correct and evaluating as intended?
     *   Inspect loop sources: Is the `source` variable resolving to a valid list?
     *   Examine extraction rules: Are paths correct? Are there extraction failure warnings in logs or metrics?

@@ -53,6 +53,7 @@ from flow_runner import (
     RequestStep,
     LoopStep,
     ConditionStep,
+    TransformStep,
     ConditionData,
     Metrics,
     StartRequest,
@@ -158,6 +159,50 @@ async def test_substitute_variables_string_and_markers(base_config, empty_flow):
     assert runner._substitute_variables("##VAR:string:foo##", context) == "BAR"
     assert runner._substitute_variables("##VAR:unquoted:obj##", context) == {"k": "v"}
     assert runner._substitute_variables("Missing {{none}}", context) == "Missing "
+
+
+def test_substitute_random_variables_cached(base_config, empty_flow):
+    runner = make_runner(base_config, empty_flow)
+    context = {}
+    first_int = runner._substitute_variables("{{RANDOM_INT}}", context)
+    second_int = runner._substitute_variables("{{RANDOM_INT}}", context)
+    assert first_int == second_int
+    assert int(first_int) >= 0
+
+    first_range = runner._substitute_variables("{{RANDOM_INT(5, 5)}}", context)
+    second_range = runner._substitute_variables("{{RANDOM_INT(5, 5)}}", context)
+    assert first_range == "5"
+    assert first_range == second_range
+
+    first_str = runner._substitute_variables("{{RANDOM_STRING(8)}}", context)
+    second_str = runner._substitute_variables("{{RANDOM_STRING(8)}}", context)
+    assert first_str == second_str
+    assert len(first_str) == 8
+
+
+def test_substitute_random_unquoted_marker(base_config, empty_flow):
+    runner = make_runner(base_config, empty_flow)
+    context = {}
+    value = runner._substitute_variables("##VAR:unquoted:RANDOM_INT(1, 1)##", context)
+    assert value == 1
+
+
+@pytest.mark.asyncio
+async def test_transform_step_updates_context(base_config, empty_flow):
+    runner = make_runner(base_config, empty_flow)
+    context = {"payload": {"exp": 100}}
+    step = TransformStep(
+        id="t1",
+        name="Transform",
+        type="transform",
+        ops=[
+            {"op": "math_add", "set": "sum", "args": [1, 2]},
+            {"op": "json_set", "set": "payload", "args": [{"ref": "payload"}, "exp", 110]},
+        ],
+    )
+    await runner._execute_transform_step(step, context, depth=0, user_id_log="test")
+    assert context["sum"] == 3
+    assert context["payload"]["exp"] == 110
 
 
 def test_extract_data_status_headers_and_body(base_config, empty_flow):
@@ -592,7 +637,7 @@ async def test_simulate_user_lifecycle_run_once(monkeypatch, empty_flow):
 
     contexts = []
 
-    async def fake_execute_steps(steps, session_obj, base_headers=None, flow_headers=None, context=None, depth=0):
+    async def fake_execute_steps(steps, session=None, base_headers=None, flow_headers=None, context=None, depth=0, **kwargs):
         contexts.append(context.copy())
 
     monkeypatch.setattr(runner, "_execute_steps", fake_execute_steps)
