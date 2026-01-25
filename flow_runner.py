@@ -7,6 +7,7 @@ import hashlib
 import hmac
 import json
 import random
+import os
 import time
 import psutil # Although imported, psutil is not used in the provided code. Keep for consistency.
 from typing import List, Dict, Any, Optional, Union, Literal
@@ -59,8 +60,10 @@ if not logger.handlers:  # Only check handlers on this logger, not parents
 logger.propagate = not added_handler
 
 # --- Exports for flow_container_control ---
+__version__ = "1.2.0"
+FLOWRUNNER_VERSION = os.getenv("FLOWRUNNER_VERSION", __version__)
 __all__ = [
-    "asyncio", "logger", "StartRequest", "FlowRunner", "Metrics"
+    "asyncio", "logger", "StartRequest", "FlowRunner", "Metrics", "FLOWRUNNER_VERSION", "__version__"
 ]
 
 # ---------------------------
@@ -1341,7 +1344,10 @@ class FlowRunner:
         self.default_port = 443 if self.original_scheme == 'https' else 80
         self.target_ip = self.config.flow_target_dns_override # Already validated by Pydantic
 
-        logger.info(f"Flow Runner Initialized: Target='{self.config.flow_target_url}', Target Sim Users={self.config.sim_users}, DNS Override={self.target_ip or 'None'}, Debug={self.config.debug}")
+        logger.info(
+            f"Flow Runner Initialized (v{FLOWRUNNER_VERSION}): Target='{self.config.flow_target_url}', "
+            f"Target Sim Users={self.config.sim_users}, DNS Override={self.target_ip or 'None'}, Debug={self.config.debug}"
+        )
         if len(self.flowmaps) == 1:
             flow_name = getattr(self.flowmap, 'name', 'N/A')
             num_steps = len(self.flowmap.steps) if self.flowmap and self.flowmap.steps else 0
