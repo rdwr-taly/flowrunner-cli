@@ -35,5 +35,13 @@ RUN mkdir -p /config
 # Expose port 9090 for Prometheus metrics and health endpoint
 EXPOSE 9090
 
+# Health check against ShowRunner SDK metrics/health endpoint
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD curl -f http://localhost:9090/healthz || exit 1
+
+# Set ownership and switch to non-root user
+RUN chown -R ${APP_USER}:${APP_USER} /app /config
+USER ${APP_USER}
+
 # App owns its own process — no CC framework wrapping
 CMD ["python", "main.py"]
