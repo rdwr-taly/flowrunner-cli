@@ -25,28 +25,15 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Install additional dependencies for Container Control Core
-RUN pip install --no-cache-dir fastapi uvicorn psutil ruamel.yaml
-
-# Clone Container Control Core v1.0 from GitHub
-RUN apt-get update && apt-get install -y --no-install-recommends git && \
-    git clone --branch v1.0.0 --depth 1 https://github.com/rdwr-taly/container-control.git /tmp/container-control && \
-    cp /tmp/container-control/app_adapter.py . && \
-    rm -rf /tmp/container-control && \
-    apt-get remove -y git && \
-    apt-get autoremove -y && \
-    rm -rf /var/lib/apt/lists/*
-
-# Copy application-specific files
-COPY flowrunner_adapter.py .
-COPY config.yaml .
-COPY container_control_core.py .
-
-# Copy FlowRunner application code
+# Copy application code
 COPY flow_runner.py .
+COPY main.py .
 
-# Expose port 8080 for the Container Control API
-EXPOSE 8080
+# Create config mount point
+RUN mkdir -p /config
 
-# Run Container Control Core with FlowRunner adapter
-CMD ["python", "-m", "uvicorn", "container_control_core:app", "--host", "0.0.0.0", "--port", "8080"]
+# Expose port 9090 for Prometheus metrics and health endpoint
+EXPOSE 9090
+
+# App owns its own process — no CC framework wrapping
+CMD ["python", "main.py"]
