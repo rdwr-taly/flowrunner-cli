@@ -13,4 +13,4 @@ aiohttp>=3.10.10
 pydantic>=2.9.2
 psutil>=5.9.5
 requests>=2.28.0
-showrunner-sdk[full]>=0.1.0
+showrunner-sdk[full] @ git+https://github.com/rdwr-taly/showrunner-sdk.git@main

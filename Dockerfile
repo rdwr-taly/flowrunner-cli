@@ -10,7 +10,7 @@ RUN ln -snf /usr/share/zoneinfo/UTC /etc/localtime && echo "UTC" > /etc/timezone
 
 # Install system packages for traffic control and monitoring (optional)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      iproute2 iptables sudo curl && \
+      iproute2 iptables sudo curl git && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # Create non-root user for running applications
