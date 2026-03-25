@@ -1,0 +1,95 @@
+{
+  "$schema": "showrunner/v1",
+  "id": "flowrunner-cli",
+  "name": "FlowRunner CLI",
+  "description": "Advanced API flow generator that simulates complex user journeys and API interactions using predefined flowmaps.",
+  "category": "Traffic Tools",
+  "icon": "fas fa-project-diagram",
+  "lifecycle": "long-running",
+  "image": {
+    "name": "razor29/flowrunner-cli"
+  },
+  "sdk": {
+    "version": ">=0.1.0",
+    "metrics_port": 9090,
+    "health_path": "/healthz",
+    "metrics_path": "/metrics"
+  },
+  "config_schema": {
+    "type": "object",
+    "properties": {
+      "config": {
+        "type": "object",
+        "title": "Runner Configuration",
+        "properties": {
+          "target_url": {
+            "type": "string",
+            "title": "Target URL"
+          },
+          "sim_users": {
+            "type": "integer",
+            "title": "Simulated Users",
+            "default": 5
+          },
+          "ramp_up_seconds": {
+            "type": "integer",
+            "title": "Ramp Up (seconds)",
+            "default": 0
+          },
+          "duration_seconds": {
+            "type": "integer",
+            "title": "Duration (seconds)",
+            "default": 0,
+            "description": "0 = run indefinitely"
+          },
+          "think_time_ms": {
+            "type": "integer",
+            "title": "Think Time (ms)",
+            "default": 1000
+          },
+          "request_timeout_ms": {
+            "type": "integer",
+            "title": "Request Timeout (ms)",
+            "default": 10000
+          },
+          "debug": {
+            "type": "boolean",
+            "title": "Debug Mode",
+            "default": false
+          }
+        }
+      },
+      "flowmap": {
+        "type": "object",
+        "title": "Flowmap",
+        "description": "Flow definition (from FlowX editor or ShowRunner flows)"
+      }
+    },
+    "required": ["config", "flowmap"]
+  },
+  "ui": {
+    "sections": [
+      {
+        "title": "Target Configuration",
+        "fields": ["config.target_url"]
+      },
+      {
+        "title": "Load Settings",
+        "fields": ["config.sim_users", "config.ramp_up_seconds", "config.duration_seconds", "config.think_time_ms"]
+      },
+      {
+        "title": "Advanced",
+        "fields": ["config.request_timeout_ms", "config.debug"]
+      }
+    ],
+    "card_fields": {
+      "primary_label": "config.target_url",
+      "metrics": ["flowrunner_requests_per_second", "flowrunner_active_users"]
+    }
+  },
+  "capabilities": {
+    "can_stop": true,
+    "can_redeploy": true,
+    "can_resume": false
+  }
+}
