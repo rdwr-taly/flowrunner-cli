@@ -6,48 +6,7 @@
     "can_update_while_running": false
   },
   "category": "Traffic Tools",
-  "containerControl": {
-    "actions": {
-      "start": {
-        "endpoint": "/api/start",
-        "method": "POST",
-        "payload_template": {
-          "config": {
-            "Allow Flow Concurrency": "{{env.ALLOW_FLOW_CONCURRENCY}}",
-            "Debug": "{{env.DEBUG_MODE}}",
-            "Flow Cycle Delay MS": "{{env.FLOW_CYCLE_DELAY_MS}}",
-            "Flow Target DNS Override": "{{env.FLOW_TARGET_DNS_OVERRIDE}}",
-            "Flow Target URL": "{{env.FLOW_TARGET_URL}}",
-            "Maximum Step Sleep MS": "{{env.MAX_SLEEP_MS}}",
-            "Minimum Step Sleep MS": "{{env.MIN_SLEEP_MS}}",
-            "Override Step URL Host": "{{env.OVERRIDE_STEP_URL_HOST}}",
-            "Simulated Users": "{{env.SIM_USERS}}",
-            "XFF Header Name": "{{env.XFF_HEADER_NAME}}"
-          },
-          "flowmaps": "{{flowmap_json_for_env.FLOWMAP_IDS}}"
-        },
-        "payload_template_type": "custom"
-      },
-      "stop": {
-        "endpoint": "/api/stop",
-        "method": "POST"
-      }
-    },
-    "api_port_fixed": 8080,
-    "enabled": true,
-    "metrics_endpoint_path": "/api/metrics"
-  },
   "deployment": {
-    "container_command_template": [
-      "python",
-      "-m",
-      "uvicorn",
-      "container_control_core:app",
-      "--host",
-      "0.0.0.0",
-      "--port",
-      "8080"
-    ],
     "default_env_vars": [
       {
         "label": "Flow Target URL",
@@ -109,16 +68,30 @@
         "ui_type": "flowmap_multi_select"
       },
       {
-        "__idx": 1757848679584,
         "default_value": true,
         "label": "Allow Flow Concurrency",
         "name": "ALLOW_FLOW_CONCURRENCY",
         "type": "boolean"
       }
-    ]
+    ],
+    "sdk_config_template": {
+      "config": {
+        "Allow Flow Concurrency": "{{env.ALLOW_FLOW_CONCURRENCY}}",
+        "Debug": "{{env.DEBUG_MODE}}",
+        "Flow Cycle Delay MS": "{{env.FLOW_CYCLE_DELAY_MS}}",
+        "Flow Target DNS Override": "{{env.FLOW_TARGET_DNS_OVERRIDE}}",
+        "Flow Target URL": "{{env.FLOW_TARGET_URL}}",
+        "Maximum Step Sleep MS": "{{env.MAX_SLEEP_MS}}",
+        "Minimum Step Sleep MS": "{{env.MIN_SLEEP_MS}}",
+        "Override Step URL Host": "{{env.OVERRIDE_STEP_URL_HOST}}",
+        "Simulated Users": "{{env.SIM_USERS}}",
+        "XFF Header Name": "{{env.XFF_HEADER_NAME}}"
+      },
+      "flowmaps": "{{flowmap_json_for_env.FLOWMAP_IDS}}"
+    }
   },
   "deploymentContext": "app",
-  "description": "Execute multi-step API flows continuously with Container Control v2.0.",
+  "description": "Execute multi-step API flows continuously using ShowRunner SDK.",
   "displayName": "FlowRunner",
   "icon": "fas fa-project-diagram",
   "id": "flowrunner-cli",
@@ -148,7 +121,7 @@
     "prometheus": {
       "enabled": true,
       "scrape_path": "/metrics",
-      "scrape_port_number": 8080
+      "scrape_port_number": 9090
     }
   },
   "subCategory": "API Simulation",
