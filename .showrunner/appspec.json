@@ -150,18 +150,18 @@
     ],
     "card_primary_metric": {
       "label": "RPS",
-      "source_path": "adapter_metrics.flow_runner.rps",
+      "source_path": "flowrunner_requests_per_second",
       "unit": "rps"
     },
     "card_secondary_metrics": [
       {
         "label": "Active Users",
-        "source_path": "adapter_metrics.flow_runner.active_users",
+        "source_path": "flowrunner_active_users",
         "unit": ""
       },
       {
         "label": "Avg Flow Duration",
-        "source_path": "adapter_metrics.flow_runner.avg_flow_duration_ms",
+        "source_path": "flowrunner_avg_flow_duration_ms",
         "unit": "ms"
       }
     ],
