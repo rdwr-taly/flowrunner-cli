@@ -7,6 +7,22 @@
   },
   "category": "Traffic Tools",
   "deployment": {
+    "sdk_config_template": {
+      "config": {
+        "Flow Target URL": "{{env.FLOW_TARGET_URL}}",
+        "Flow Target DNS Override": "{{env.FLOW_TARGET_DNS_OVERRIDE}}",
+        "XFF Header Name": "{{env.XFF_HEADER_NAME}}",
+        "Simulated Users": "{{env.SIM_USERS}}",
+        "Minimum Step Sleep MS": "{{env.MIN_SLEEP_MS}}",
+        "Maximum Step Sleep MS": "{{env.MAX_SLEEP_MS}}",
+        "Override Step URL Host": "{{env.OVERRIDE_STEP_URL_HOST}}",
+        "Debug": "{{env.DEBUG_MODE}}",
+        "Flow Cycle Delay MS": "{{env.FLOW_CYCLE_DELAY_MS}}",
+        "Allow Flow Concurrency": "{{env.ALLOW_FLOW_CONCURRENCY}}",
+        "Run Once": "{{env.RUN_ONCE}}"
+      },
+      "flowmaps": "{{flowmap_json_for_env.FLOWMAP_IDS}}"
+    },
     "default_env_vars": [
       {
         "label": "Flow Target URL",
@@ -72,42 +88,57 @@
         "label": "Allow Flow Concurrency",
         "name": "ALLOW_FLOW_CONCURRENCY",
         "type": "boolean"
-      }
-    ],
-    "sdk_config_template": {
-      "config": {
-        "Allow Flow Concurrency": "{{env.ALLOW_FLOW_CONCURRENCY}}",
-        "Debug": "{{env.DEBUG_MODE}}",
-        "Flow Cycle Delay MS": "{{env.FLOW_CYCLE_DELAY_MS}}",
-        "Flow Target DNS Override": "{{env.FLOW_TARGET_DNS_OVERRIDE}}",
-        "Flow Target URL": "{{env.FLOW_TARGET_URL}}",
-        "Maximum Step Sleep MS": "{{env.MAX_SLEEP_MS}}",
-        "Minimum Step Sleep MS": "{{env.MIN_SLEEP_MS}}",
-        "Override Step URL Host": "{{env.OVERRIDE_STEP_URL_HOST}}",
-        "Simulated Users": "{{env.SIM_USERS}}",
-        "XFF Header Name": "{{env.XFF_HEADER_NAME}}"
       },
-      "flowmaps": "{{flowmap_json_for_env.FLOWMAP_IDS}}"
-    }
+      {
+        "default_value": false,
+        "label": "Run Once",
+        "name": "RUN_ONCE",
+        "type": "boolean"
+      }
+    ]
   },
   "deploymentContext": "app",
-  "description": "Execute multi-step API flows continuously using ShowRunner SDK.",
+  "description": "Execute multi-step API flows using ShowRunner SDK. Supports continuous, scheduled, and recurring execution modes.",
   "displayName": "FlowRunner",
   "icon": "fas fa-project-diagram",
   "id": "flowrunner-cli",
   "image_id_ref": "razor29/flowrunner-cli",
   "lifecycleOptions": [
     {
-      "description": "Run flows continuously until stopped.",
+      "description": "Run flows continuously until manually stopped.",
       "isDefault": true,
-      "label": "Continuous Flow",
+      "label": "Continuous",
       "lifecycle": "stateful"
     },
     {
-      "description": "Run a flow burst on a repeating interval.",
-      "label": "Scheduled Flow Burst",
-      "lifecycle": "recurrent",
+      "description": "Run flows continuously during a scheduled time window (start to end time).",
+      "label": "Scheduled",
+      "lifecycle": "scheduled",
       "scheduling_fields": {
+        "end_time_utc": {
+          "label": "End Time (UTC)",
+          "required": true
+        },
+        "start_time_utc": {
+          "label": "Start Time (UTC)",
+          "required": true
+        },
+        "type": "one_time"
+      }
+    },
+    {
+      "description": "Run flow(s) once on a repeating interval. Container exits after each run and restarts on the next interval.",
+      "label": "Recurring",
+      "lifecycle": "recurrent",
+      "overrides": {
+        "deployment": {
+          "env_var_defaults": {
+            "RUN_ONCE": true
+          }
+        }
+      },
+      "scheduling_fields": {
+        "interval_unit": "minutes",
         "interval_value": 60,
         "max_concurrent_runs": 1,
         "start_time_utc": {
@@ -161,7 +192,7 @@
       },
       {
         "label": "Avg Flow Duration",
-        "source_path": "flowrunner_avg_flow_duration_ms",
+        "source_path": "flowrunner_avg_flow_duration_milliseconds",
         "unit": "ms"
       }
     ],
@@ -183,5 +214,6 @@
         "title": "FlowRunner Settings"
       }
     ]
-  }
+  },
+  "schema_version": 6
 }
