@@ -2,6 +2,7 @@
 
 import asyncio
 import aiohttp
+import ssl
 import base64
 import hashlib
 import hmac
@@ -228,6 +229,14 @@ class ContainerConfig(BaseModel):
             "Default is continuous operation."
         ),
     )
+    ignore_ssl_errors: bool = Field(
+        default=False,
+        description="If true, disable TLS certificate verification for the target (like curl -k).",
+    )
+    trusted_ca_cert: Optional[str] = Field(
+        default=None,
+        description="PEM-encoded CA certificate(s) to trust, in addition to the system trust store.",
+    )
 
     class Config:
         populate_by_name = True
@@ -243,6 +252,8 @@ class ContainerConfig(BaseModel):
             'flow_cycle_delay_ms': 'Flow Cycle Delay MS',
             'allow_flow_concurrency': 'Allow Flow Concurrency',
             'run_once': 'Run Once',
+            'ignore_ssl_errors': 'Ignore SSL Errors',
+            'trusted_ca_cert': 'Trusted CA Certificate',
         }.get(field_name, field_name)
         extra = "allow" # Allow extra fields but ignore them
 
@@ -1382,6 +1393,28 @@ class FlowRunner:
         except Exception as trace_err:
             logger.debug(f"Trace hook error (request end): {trace_err}")
 
+    def _build_ssl_param(self):
+        """Resolve the aiohttp ``ssl`` connector argument from config.
+
+        Precedence:
+          1. ``ignore_ssl_errors`` -> ``False`` (disable TLS verification, like ``curl -k``).
+          2. ``trusted_ca_cert``   -> an ``SSLContext`` trusting that CA plus the system store.
+          3. otherwise             -> default verification for HTTPS, no TLS for HTTP.
+        """
+        if self.config.ignore_ssl_errors:
+            logger.warning("TLS certificate verification is DISABLED (ignore_ssl_errors=true).")
+            return False
+        ca = (self.config.trusted_ca_cert or "").strip()
+        if ca:
+            try:
+                ctx = ssl.create_default_context()
+                ctx.load_verify_locations(cadata=ca)
+                logger.info("Loaded custom Trusted CA Certificate for TLS verification.")
+                return ctx
+            except Exception as e:
+                logger.error(f"Failed to load Trusted CA Certificate; using default verification. Error: {e}")
+        return None if self.original_scheme == 'https' else False
+
     def create_aiohttp_connector(self) -> aiohttp.BaseConnector:
         """Creates an aiohttp connector, applying DNS override if configured."""
         resolver = None
@@ -1404,15 +1437,8 @@ class FlowRunner:
                  logger.error(f"Failed to configure DNS override for {self.original_host}:{self.parsed_url.port or self.default_port} -> {self.target_ip}. Error: {e}. Using default DNS.")
                  resolver = None # Fallback to default
 
-        # Determine SSL context based on target scheme
-        # Use None for default SSL context (recommended), False to disable SSL checks (use with caution)
-        ssl_context = None if self.original_scheme == 'https' else False
-        if self.original_scheme != 'https' and ssl_context is None:
-            logger.warning(f"Target scheme is '{self.original_scheme}', but default SSL context is being used. Consider setting ssl=False in TCPConnector if HTTPS is not intended.")
-        elif self.original_scheme == 'https':
-             logger.debug("Using default SSL context for HTTPS target.")
-        elif ssl_context is False:
-             logger.debug("SSL verification disabled for HTTP target.")
+        # SSL handling: ignore-errors (-k), custom CA, or default (see _build_ssl_param).
+        ssl_context = self._build_ssl_param()
 
 
         # Create the connector

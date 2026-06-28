@@ -19,7 +19,9 @@
         "Debug": "{{env.DEBUG_MODE}}",
         "Flow Cycle Delay MS": "{{env.FLOW_CYCLE_DELAY_MS}}",
         "Allow Flow Concurrency": "{{env.ALLOW_FLOW_CONCURRENCY}}",
-        "Run Once": "{{env.RUN_ONCE}}"
+        "Run Once": "{{env.RUN_ONCE}}",
+        "Ignore SSL Errors": "{{env.IGNORE_SSL_ERRORS}}",
+        "Trusted CA Certificate": "{{env.TRUSTED_CA_CERT}}"
       },
       "flowmaps": "{{flowmap_json_for_env.FLOWMAP_IDS}}"
     },
@@ -94,6 +96,18 @@
         "label": "Run Once",
         "name": "RUN_ONCE",
         "type": "boolean"
+      },
+      {
+        "default_value": false,
+        "label": "Ignore SSL Errors",
+        "name": "IGNORE_SSL_ERRORS",
+        "type": "boolean"
+      },
+      {
+        "label": "Trusted CA Certificate (PEM)",
+        "name": "TRUSTED_CA_CERT",
+        "type": "string",
+        "ui_type": "json_textarea"
       }
     ]
   },
@@ -209,7 +223,9 @@
           "OVERRIDE_STEP_URL_HOST",
           "DEBUG_MODE",
           "FLOWMAP_IDS",
-          "ALLOW_FLOW_CONCURRENCY"
+          "ALLOW_FLOW_CONCURRENCY",
+          "IGNORE_SSL_ERRORS",
+          "TRUSTED_CA_CERT"
         ],
         "title": "FlowRunner Settings"
       }
