@@ -733,7 +733,10 @@ def _normalize_transform_op(op: Any) -> Dict[str, Any]:
 
     op_name = safe_op.get("op")
     if op_name not in _TRANSFORM_OP_DEFS:
-        op_name = "base64_decode"
+        # Never silently substitute a different op (historically base64_decode). Callers
+        # must skip unknown ops with a warning; this raise is defense-in-depth so no code
+        # path can execute the wrong operation against live traffic.
+        raise ValueError(f'Unsupported transform op "{op_name}".')
 
     defn = _TRANSFORM_OP_DEFS[op_name]
     raw_args = safe_op.get("args")
@@ -1168,6 +1171,40 @@ def execute_transform_ops(ops: Any, context: Dict[str, Any], evaluate_path: Opti
     output = {"updatedVars": [], "warnings": []}
     ops_list = ops if isinstance(ops, list) else []
     for index, op in enumerate(ops_list):
+        # Graceful degradation: an unknown/newer transform op is SKIPPED with a
+        # machine-readable warning rather than silently downgraded to base64_decode
+        # (which would run the wrong operation against live traffic) or raised (which
+        # would set flow_error and halt the whole flow). Known ops proceed normally.
+        if isinstance(op, TransformOp):
+            raw_op = op.model_dump()
+        elif isinstance(op, dict):
+            raw_op = op
+        else:
+            raw_op = {}
+        op_name = raw_op.get("op")
+        # Unknown-op detection mirrors _normalize_transform_op's check below; keep the
+        # two in sync if op-name normalization/aliasing is ever introduced.
+        if op_name not in _TRANSFORM_OP_DEFS:
+            set_hint = raw_op.get("set") if isinstance(raw_op.get("set"), str) else None
+            var_phrase = f'output variable "{set_hint}" left unset' if set_hint else "no output variable set"
+            output["warnings"].append({
+                "type": "unsupported_transform_op",
+                "op": op_name,
+                "set": set_hint,
+                "index": index,
+                "status": "skipped",
+                "message": (
+                    f'Unsupported transform op "{op_name}" at position {index + 1}; '
+                    f'skipped ({var_phrase}). This runner may be older than the flow '
+                    f'that produced it.'
+                ),
+            })
+            logger.error(
+                "TRANSFORM_OP_UNSUPPORTED op=%r set=%r index=%d - skipped, not executed "
+                "(refusing to silently substitute base64_decode).",
+                op_name, set_hint, index,
+            )
+            continue
         normalized = _normalize_transform_op(op)
         set_name = normalized.get("set")
         if not isinstance(set_name, str) or not set_name:
@@ -2809,6 +2846,10 @@ class FlowRunner:
             ops = step.ops or []
             logger.debug(f"{indent}User {user_id_log}: Transform {step_identifier}: Executing {len(ops)} ops.")
             output = execute_transform_ops(ops, context, evaluate_path=get_value_from_context)
+            for warning in output.get("warnings", []):
+                logger.warning(
+                    f"{indent}User {user_id_log}: Transform {step_identifier}: {warning.get('message')}"
+                )
             logger.debug(f"{indent}User {user_id_log}: Transform {step_identifier}: Updated vars {output.get('updatedVars', [])}.")
         except Exception as exc:
             logger.error(
