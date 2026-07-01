@@ -54,12 +54,15 @@ from flow_runner import (
     LoopStep,
     ConditionStep,
     TransformStep,
+    TransformOp,
     ConditionData,
     Metrics,
     StartRequest,
     get_value_from_context,
     _MISSING,
     set_value_in_context,
+    execute_transform_ops,
+    _normalize_transform_op,
     logger as fr_logger,
 )
 
@@ -203,6 +206,105 @@ async def test_transform_step_updates_context(base_config, empty_flow):
     await runner._execute_transform_step(step, context, depth=0, user_id_log="test")
     assert context["sum"] == 3
     assert context["payload"]["exp"] == 110
+
+
+def test_execute_transform_ops_skips_unknown_op_without_downgrade():
+    # An unknown/newer transform op must NOT be silently rewritten to base64_decode.
+    # It is skipped with a machine-readable warning; later known ops still run.
+    context: Dict[str, Any] = {}
+    ops = [
+        # "SGVsbG8" base64url-decodes to "Hello". If the old bug downgrades this to
+        # base64_decode, context["decoded"] would become "Hello". It must stay unset.
+        {"op": "totally_unknown_future_op", "set": "decoded", "args": ["SGVsbG8"]},
+        {"op": "math_add", "set": "sum", "args": [1, 2]},
+    ]
+    output = execute_transform_ops(ops, context)
+    # unknown op skipped: variable never set (definitely not base64-decoded to "Hello")
+    assert "decoded" not in context
+    # subsequent known op still executed
+    assert context["sum"] == 3
+    assert "sum" in output["updatedVars"]
+    assert "decoded" not in output["updatedVars"]
+    # a machine-readable warning was recorded for the skipped op
+    warnings = output["warnings"]
+    assert len(warnings) == 1
+    w = warnings[0]
+    assert w["op"] == "totally_unknown_future_op"
+    assert w["set"] == "decoded"
+    assert w["status"] == "skipped"
+
+
+def test_normalize_transform_op_raises_on_unknown_op():
+    # Defense in depth: normalization must never silently substitute base64_decode.
+    with pytest.raises(ValueError):
+        _normalize_transform_op({"op": "nope_not_real", "set": "x", "args": ["SGVsbG8"]})
+
+
+@pytest.mark.asyncio
+async def test_transform_step_skips_unknown_op_without_halting(base_config, empty_flow):
+    # Graceful degradation: an unknown op does not halt the flow (no flow_error is set)
+    # and known ops in the same step still apply.
+    runner = make_runner(base_config, empty_flow)
+    context: Dict[str, Any] = {}
+    step = TransformStep(
+        id="t2",
+        name="Transform",
+        type="transform",
+        ops=[
+            {"op": "totally_unknown_future_op", "set": "decoded", "args": ["SGVsbG8"]},
+            {"op": "math_add", "set": "sum", "args": [2, 3]},
+        ],
+    )
+    await runner._execute_transform_step(step, context, depth=0, user_id_log="test")
+    # no crash / no halt
+    assert get_value_from_context(context, "flow_error") is _MISSING
+    # unknown op did not run (not downgraded to base64_decode)
+    assert "decoded" not in context
+    # known op still ran
+    assert context["sum"] == 5
+
+
+def test_execute_transform_ops_skips_unknown_transformop_instance():
+    # Exercises the model_dump() branch of the guard directly: an unknown op passed as a
+    # TransformOp model instance (the shape ops actually take after step validation).
+    context: Dict[str, Any] = {}
+    op = TransformOp.model_validate({"op": "unknown_model_op", "set": "decoded", "args": ["SGVsbG8"]})
+    output = execute_transform_ops([op], context)
+    assert "decoded" not in context
+    assert output["updatedVars"] == []
+    assert len(output["warnings"]) == 1
+    assert output["warnings"][0]["op"] == "unknown_model_op"
+    assert output["warnings"][0]["status"] == "skipped"
+
+
+def test_execute_transform_ops_handles_missing_op_name_and_set():
+    # op is None (missing) and set is missing -> each skipped with a warning, no crash.
+    context: Dict[str, Any] = {}
+    output = execute_transform_ops([{"args": []}, {"op": "still_unknown"}], context)
+    assert output["updatedVars"] == []
+    assert len(output["warnings"]) == 2
+    assert output["warnings"][0]["op"] is None
+    assert output["warnings"][0]["set"] is None
+
+
+@pytest.mark.asyncio
+async def test_transform_step_all_ops_unknown_does_not_halt(base_config, empty_flow):
+    # Every op unknown: the whole step degrades to a no-op and the flow is not halted.
+    runner = make_runner(base_config, empty_flow)
+    context: Dict[str, Any] = {}
+    step = TransformStep(
+        id="t3",
+        name="Transform",
+        type="transform",
+        ops=[
+            {"op": "unknown_a", "set": "a", "args": []},
+            {"op": "unknown_b", "set": "b", "args": []},
+        ],
+    )
+    await runner._execute_transform_step(step, context, depth=0, user_id_log="test")
+    assert get_value_from_context(context, "flow_error") is _MISSING
+    assert "a" not in context
+    assert "b" not in context
 
 
 def test_extract_data_status_headers_and_body(base_config, empty_flow):
