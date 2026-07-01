@@ -1,0 +1,94 @@
+{
+    "id": "golden-old-flow-1",
+    "name": "Golden Old Flow (pre-sprint)",
+    "description": "A real pre-sprint flow used as a cross-app conformance anchor. It MUST parse to an identical execution model with no schemaVersion, with \"1.0\", and with an unknown MINOR such as \"1.5\". Do not add schemaVersion to this base file.",
+    "headers": {
+        "Accept": "application/json",
+        "X-Client": "flowrunner-cli"
+    },
+    "staticVars": {
+        "basePath": "/api/v1",
+        "maxItems": 5,
+        "enabled": true
+    },
+    "steps": [
+        {
+            "id": "login",
+            "name": "Authenticate",
+            "type": "request",
+            "method": "POST",
+            "url": "{{basePath}}/login",
+            "headers": {
+                "Content-Type": "application/json"
+            },
+            "body": {
+                "user": "##VAR:string:username##",
+                "pass": "##VAR:string:password##"
+            },
+            "extract": {
+                "token": "body.data.sessionToken",
+                "loginStatus": ".status"
+            },
+            "onFailure": "stop"
+        },
+        {
+            "id": "check-token",
+            "name": "Token present?",
+            "type": "condition",
+            "conditionData": {
+                "variable": "token",
+                "operator": "exists",
+                "value": ""
+            },
+            "then": [
+                {
+                    "id": "list-items",
+                    "name": "List items",
+                    "type": "request",
+                    "method": "GET",
+                    "url": "{{basePath}}/items?limit={{maxItems}}",
+                    "headers": {
+                        "Authorization": "Bearer {{token}}"
+                    },
+                    "extract": {
+                        "items": "body.data.items",
+                        "firstId": "body.data.items[0].id"
+                    },
+                    "onFailure": "continue"
+                },
+                {
+                    "id": "loop-items",
+                    "name": "Iterate items",
+                    "type": "loop",
+                    "source": "{{items}}",
+                    "loopVariable": "item",
+                    "steps": [
+                        {
+                            "id": "fetch-item",
+                            "name": "Fetch item detail",
+                            "type": "request",
+                            "method": "GET",
+                            "url": "{{basePath}}/items/{{item.id}}",
+                            "onFailure": "continue"
+                        }
+                    ]
+                }
+            ],
+            "else": [
+                {
+                    "id": "no-token-transform",
+                    "name": "Record failure marker",
+                    "type": "transform",
+                    "ops": [
+                        {
+                            "op": "to_string",
+                            "set": "authFailed",
+                            "args": ["{{loginStatus}}"],
+                            "options": {}
+                        }
+                    ]
+                }
+            ]
+        }
+    ]
+}
