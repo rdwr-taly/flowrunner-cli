@@ -79,6 +79,20 @@ class BaseStep(BaseModel):
     name: Optional[str] = Field(None, description="Human-readable name for the step")
     # type will be defined in subclasses using Literal
 
+class RetryConfig(BaseModel):
+    """Additive per-request retry policy. Mirrors the FlowRunner UI JS engine.
+
+    ``count`` = number of RETRIES after the first attempt (0 => single attempt,
+    IDENTICAL to prior behavior). ``delayMs`` = fixed backoff slept between
+    attempts. A retry fires on a non-2xx HTTP status OR a network/fetch error,
+    but NEVER after a user-requested stop.
+    """
+    count: int = Field(0, ge=0, description="Number of retries after the first attempt (default 0).")
+    delayMs: int = Field(0, ge=0, description="Delay in milliseconds slept between attempts.")
+
+    model_config = ConfigDict(extra="ignore")
+
+
 class RequestStep(BaseStep):
     type: Literal['request'] = Field(..., description="Specifies the step type as 'request'")
     method: str = Field(..., description="HTTP method (GET, POST, PUT, etc.)")
@@ -91,6 +105,14 @@ class RequestStep(BaseStep):
     body: Optional[Union[Dict[str, Any], str]] = Field(None, description="Request body (JSON object or raw string). Can contain {{variables}}.")
     extract: Optional[Dict[str, str]] = Field(default_factory=dict, description="Mapping of variable names to extract from response using path notation (e.g., 'token': 'body.data.sessionToken', 'firstId': 'body.data.items[0].id', 'status_code': '.status', 'header_val': 'headers.Content-Type')") # Updated description with prefixes
     onFailure: Literal['stop', 'continue'] = Field(..., description="Action on request failure (status >= 300): 'stop' or 'continue'.") # Added onFailure field
+    retries: Optional[RetryConfig] = Field(
+        None,
+        description="Additive per-request retry policy {count, delayMs}. Absent/None => single attempt.",
+    )
+    assertions: Optional[List["Assertion"]] = Field(
+        None,
+        description="Additive declarative assertions evaluated against the response using the conditionData operator vocabulary.",
+    )
 
     @field_validator('method')
     def validate_method(cls, v):
@@ -107,6 +129,24 @@ class ConditionData(BaseModel):
     variable: str = Field("", description="Variable name or path (e.g., data.values[0].id, response_step_123_status) to evaluate")
     operator: str = Field("", description="Operation to perform (e.g., 'equals', 'exists', 'is_number', 'greater_than')")
     value: Optional[str] = Field("", description="Value to compare against (for operators that need it)")
+
+class Assertion(BaseModel):
+    """Additive declarative assertion on a request step's result.
+
+    Reuses the frozen ``conditionData`` operator vocabulary (see
+    ``_evaluate_structured_condition``) so authoring stays consistent across the
+    UI, CLI, and portal. ``variable`` is a context path evaluated AFTER the
+    request completes (e.g. ``response_<id>_status``, ``body.data.ok``, or any
+    extracted variable). An unknown operator or missing target degrades to a
+    failed assertion with a warning — it never crashes the run.
+    """
+    name: Optional[str] = Field(None, description="Human-readable label for the assertion (optional).")
+    variable: str = Field("", description="Context path to evaluate (e.g. 'response_s1_status', 'body.data.id').")
+    operator: str = Field("", description="Operator from the conditionData vocabulary (e.g. 'equals', 'exists', 'greater_than').")
+    value: Optional[str] = Field("", description="Comparison value for operators that need it.")
+
+    model_config = ConfigDict(extra="ignore")
+
 
 class ConditionStep(BaseStep):
     type: Literal['condition'] = Field(..., description="Specifies the step type as 'condition'")
@@ -163,9 +203,62 @@ FlowStep = Annotated[
 ]
 
 # Update nested references in ConditionStep and LoopStep
+RequestStep.model_rebuild()  # resolves the forward ref to Assertion
 ConditionStep.model_rebuild()
 LoopStep.model_rebuild()
 TransformStep.model_rebuild()
+
+# --- Cross-app schemaVersion gate ---------------------------------------
+# The shared .flow.json format carries an OPTIONAL top-level ``schemaVersion``
+# string "MAJOR.MINOR" (e.g. "1.0"). ABSENCE means "1.0" (HAR log.version
+# precedent, zero-migration). Contract (docs/schema-versioning.md in the
+# FlowRunner UI repo):
+#   * Unknown MINOR within the supported MAJOR  -> TOLERATE (accept, warn once,
+#     let per-construct graceful degradation handle anything newer).
+#   * Unknown MAJOR (>= 2)                       -> REJECT LOUDLY, so a 24/7
+#     container never best-effort mis-executes a genuinely newer format.
+# Never make schemaVersion required and never gate the wire format on a MINOR.
+SUPPORTED_SCHEMA_MAJOR = 1
+_SCHEMA_VERSION_RE = re.compile(r"^(\d+)\.(\d+)$")
+
+
+def parse_schema_version(raw: Any) -> "tuple[int, int]":
+    """Coerce a raw ``schemaVersion`` value to a ``(major, minor)`` tuple.
+
+    Accepts a "MAJOR.MINOR" string, a bare integer (coerced to ``<int>.0`` with
+    a warning), ``None`` (=> ``(1, 0)``), or a bare "MAJOR" string. Raises
+    ``ValueError`` for anything unparseable so the caller can reject it cleanly.
+    """
+    if raw is None or raw == "":
+        return (SUPPORTED_SCHEMA_MAJOR, 0)
+
+    # Non-string (e.g. integer 2 / float 1.0): coerce-and-warn, never crash.
+    if isinstance(raw, bool):  # guard: bools are ints in Python
+        raise ValueError(f"schemaVersion must be a 'MAJOR.MINOR' string, got boolean {raw!r}")
+    if isinstance(raw, int):
+        logger.warning(
+            f"schemaVersion was provided as integer {raw!r}; coercing to string '{raw}.0'. "
+            "The canonical form is a 'MAJOR.MINOR' string (e.g. \"1.0\")."
+        )
+        return (raw, 0)
+    if isinstance(raw, float):
+        # e.g. 1.0 -> (1, 0); avoid float precision surprises via string form.
+        raw = repr(raw)
+
+    if isinstance(raw, str):
+        text = raw.strip()
+        m = _SCHEMA_VERSION_RE.match(text)
+        if m:
+            return (int(m.group(1)), int(m.group(2)))
+        # Tolerate a bare "MAJOR" (e.g. "2") as MAJOR.0.
+        if text.isdigit():
+            return (int(text), 0)
+        raise ValueError(
+            f"schemaVersion '{raw}' is not a valid 'MAJOR.MINOR' version string."
+        )
+
+    raise ValueError(f"schemaVersion has unsupported type {type(raw).__name__}: {raw!r}")
+
 
 class FlowMap(BaseModel):
     id: Optional[str | int] = Field(
@@ -180,9 +273,48 @@ class FlowMap(BaseModel):
     headers: Optional[Dict[str, str]] = Field(default_factory=dict, description="Global headers applied to all requests in the flow. Can contain {{variables}}.")
     steps: List[FlowStep] = Field(..., description="The sequence of steps defining the flow")
     staticVars: Optional[Dict[str, Any]] = Field(default_factory=dict, description="Global static variables accessible anywhere in the flow (referenced as {{varName}}). Values can be strings, numbers, booleans.") # Allow Any type
+    schemaVersion: Optional[Any] = Field(
+        None,
+        description=(
+            "OPTIONAL cross-app schema version 'MAJOR.MINOR' (absence => '1.0'). "
+            "Unknown MINOR is tolerated; unknown MAJOR (>= 2) is rejected."
+        ),
+    )
 
-    # Ignore any extra fields when parsing flow definitions
+    # Ignore any OTHER extra fields when parsing flow definitions (additive-safe).
     model_config = ConfigDict(extra="ignore")
+
+    @field_validator("schemaVersion")
+    @classmethod
+    def _gate_schema_version(cls, v: Any) -> Any:
+        """Version-gate: reject unknown MAJOR loudly, tolerate unknown MINOR."""
+        try:
+            major, minor = parse_schema_version(v)
+        except ValueError as e:
+            raise ValueError(str(e))
+
+        if major > SUPPORTED_SCHEMA_MAJOR:
+            raise ValueError(
+                f"Unsupported schemaVersion '{v}': this FlowRunner CLI supports "
+                f"schema MAJOR {SUPPORTED_SCHEMA_MAJOR}.x but the flow requires "
+                f"MAJOR {major}. Refusing to run rather than mis-execute a newer "
+                "format. Upgrade the CLI (see docs/schema-versioning.md)."
+            )
+        if major < SUPPORTED_SCHEMA_MAJOR:
+            # A lower MAJOR than we support should not happen (1 is the floor),
+            # but tolerate it: the format only grew additively above it.
+            logger.warning(
+                f"schemaVersion '{v}' has a MAJOR below the supported "
+                f"{SUPPORTED_SCHEMA_MAJOR}; treating as compatible."
+            )
+        elif minor > 0:
+            # Same MAJOR, newer MINOR: additive; tolerate + warn once.
+            logger.warning(
+                f"schemaVersion '{v}' has an unknown MINOR (supported MAJOR is "
+                f"{SUPPORTED_SCHEMA_MAJOR}). Proceeding; any unrecognized "
+                "constructs will degrade gracefully (skip-with-warning)."
+            )
+        return v
 
 # Ensure FlowMap uses the updated FlowStep
 FlowMap.model_rebuild()
@@ -2015,6 +2147,102 @@ class FlowRunner:
             return False
 
 
+    # Operators recognized by _evaluate_structured_condition. Kept in sync with
+    # that method so assertions can warn distinctly on an unknown operator
+    # (degrade-with-warning) rather than silently treating it as a plain failure.
+    _KNOWN_ASSERTION_OPERATORS = frozenset({
+        'exists', 'not_exists',
+        'is_number', 'is_text', 'is_boolean', 'is_array',
+        'is_true', 'is_false',
+        'equals', 'not_equals',
+        'greater_than', 'less_than', 'greater_equals', 'less_equals',
+        'contains', 'starts_with', 'ends_with', 'matches_regex',
+    })
+
+    def _evaluate_assertions(
+        self,
+        step_id: str,
+        step_identifier: str,
+        assertions: Optional[List["Assertion"]],
+        context: Dict[str, Any],
+    ) -> None:
+        """Evaluate a request step's declarative assertions after it completes.
+
+        Reuses the frozen conditionData operator vocabulary via
+        ``_evaluate_structured_condition``. Records a structured list under
+        ``response_<id>_assertions`` and an aggregate boolean under
+        ``response_<id>_assertions_passed``. Unknown operators / missing targets
+        degrade to a FAILED assertion with a warning; nothing here ever raises.
+        """
+        if not assertions:
+            return
+
+        results: List[Dict[str, Any]] = []
+        all_passed = True
+
+        for index, assertion in enumerate(assertions):
+            variable = (getattr(assertion, 'variable', '') or '').strip()
+            operator = (getattr(assertion, 'operator', '') or '').strip()
+            value = getattr(assertion, 'value', '')
+            label = getattr(assertion, 'name', None) or f"assertion[{index}]"
+            passed = False
+            note = None
+
+            try:
+                if not variable or not operator:
+                    note = "missing variable or operator"
+                    logger.warning(
+                        f"Step {step_identifier}: assertion '{label}' is missing a "
+                        f"variable or operator; recording as failed (degrade)."
+                    )
+                elif operator not in self._KNOWN_ASSERTION_OPERATORS:
+                    note = f"unknown operator '{operator}'"
+                    logger.warning(
+                        f"Step {step_identifier}: assertion '{label}' uses unknown "
+                        f"operator '{operator}'; recording as failed (degrade), run continues."
+                    )
+                else:
+                    # Reuse the exact structured-condition evaluator (same vocab,
+                    # same coercion, same missing-target => None handling).
+                    cond = ConditionData(variable=variable, operator=operator, value=value)
+                    passed = bool(self._evaluate_structured_condition(cond, context))
+            except Exception as e:  # defense-in-depth: never let an assertion crash the run
+                note = f"evaluation error: {e}"
+                logger.warning(
+                    f"Step {step_identifier}: assertion '{label}' raised during "
+                    f"evaluation ({e}); recording as failed (degrade)."
+                )
+                passed = False
+
+            all_passed = all_passed and passed
+            record = {
+                "name": getattr(assertion, 'name', None),
+                "variable": variable,
+                "operator": operator,
+                "value": value,
+                "passed": passed,
+            }
+            if note:
+                record["note"] = note
+            results.append(record)
+
+            log_fn = logger.info if passed else logger.warning
+            log_fn(
+                f"Step {step_identifier}: assertion '{label}' "
+                f"({variable} {operator} {value!r}) => {'PASS' if passed else 'FAIL'}"
+                + (f" [{note}]" if note else "")
+            )
+
+        set_value_in_context(context, f'response_{step_id}_assertions', results)
+        set_value_in_context(context, f'response_{step_id}_assertions_passed', all_passed)
+
+        if not all_passed:
+            failed = sum(1 for r in results if not r["passed"])
+            logger.warning(
+                f"Step {step_identifier}: {failed}/{len(results)} assertion(s) FAILED."
+            )
+
+
     def _evaluate_condition(self, condition_str: Optional[str], context: Dict[str, Any], condition_data: Optional[ConditionData] = None) -> bool:
         """
         Evaluates a condition. Prefers structured data (conditionData) if available and valid,
@@ -2557,106 +2785,149 @@ class FlowRunner:
         max_retries = 3 # Retries for connection errors or 5xx server errors
         base_retry_delay = 0.5 # seconds
 
-        for attempt in range(max_retries):
-            request_start_time = time.monotonic()
-            try:
-                async with session.request(
-                    method,
-                    final_url,
-                    headers=final_headers,
-                    json=json_payload,
-                    data=data_payload
-                    # Note: ssl handling is done via connector settings
-                ) as resp:
-                    # --- Process Response ---
-                    response_status = resp.status
-                    # Convert response headers (CIMultiDict) to a simple dict for context storage
-                    # Handle multiple Set-Cookie headers if needed later, for now just last value.
-                    response_headers_dict = {k: v for k, v in resp.headers.items()}
-                    request_duration_s = time.monotonic() - request_start_time
-                    request_succeeded = True # Mark that we got a response
+        # --- ADDITIVE: user-configured per-request retry policy (step.retries) ---
+        # Mirrors the FlowRunner UI JS engine: an outer retry loop that re-issues
+        # the WHOLE request on a non-2xx status OR a network/fetch error. count
+        # defaults to 0 => a single pass, IDENTICAL to prior behavior. delayMs is
+        # slept between passes. A user-requested stop (self.running == False) is
+        # NEVER retried. Each pass issues a fresh request (the CLI analogue of a
+        # fresh AbortController per attempt). This wraps — and is orthogonal to —
+        # the built-in connection/5xx resilience loop below (max_retries).
+        retry_cfg = getattr(step, 'retries', None)
+        user_retry_count = max(0, retry_cfg.count) if retry_cfg else 0
+        user_retry_delay_s = (max(0, retry_cfg.delayMs) / 1000.0) if retry_cfg else 0.0
 
-                    # --- Read Response Body ---
-                    response_body = None # Reset for this attempt
-                    try:
-                        resp_content_type = resp.headers.get('Content-Type', '').lower()
-                        if 'application/json' in resp_content_type:
-                             try: response_body = await resp.json(encoding='utf-8')
-                             except (json.JSONDecodeError, UnicodeDecodeError, aiohttp.ContentTypeError) as json_err:
-                                 logger.warning(f"Step {step_identifier}: Failed to decode JSON response ({resp.status}) despite Content-Type. Error: {json_err}. Reading as text.")
-                                 # Fallback: read as text
+        for user_attempt in range(user_retry_count + 1):
+            user_attempts_remaining = user_retry_count - user_attempt
+
+            # Reset per-pass outcome so a prior pass's error/state never leaks.
+            response_body = None
+            response_headers_dict = {}
+            response_status = -1
+            error_message = None
+            request_succeeded = False
+
+            for attempt in range(max_retries):
+                request_start_time = time.monotonic()
+                try:
+                    async with session.request(
+                        method,
+                        final_url,
+                        headers=final_headers,
+                        json=json_payload,
+                        data=data_payload
+                        # Note: ssl handling is done via connector settings
+                    ) as resp:
+                        # --- Process Response ---
+                        response_status = resp.status
+                        # Convert response headers (CIMultiDict) to a simple dict for context storage
+                        # Handle multiple Set-Cookie headers if needed later, for now just last value.
+                        response_headers_dict = {k: v for k, v in resp.headers.items()}
+                        request_duration_s = time.monotonic() - request_start_time
+                        request_succeeded = True # Mark that we got a response
+
+                        # --- Read Response Body ---
+                        response_body = None # Reset for this attempt
+                        try:
+                            resp_content_type = resp.headers.get('Content-Type', '').lower()
+                            if 'application/json' in resp_content_type:
+                                 try: response_body = await resp.json(encoding='utf-8')
+                                 except (json.JSONDecodeError, UnicodeDecodeError, aiohttp.ContentTypeError) as json_err:
+                                     logger.warning(f"Step {step_identifier}: Failed to decode JSON response ({resp.status}) despite Content-Type. Error: {json_err}. Reading as text.")
+                                     # Fallback: read as text
+                                     response_body = await resp.text(encoding='utf-8', errors='replace')
+                            elif resp_content_type.startswith('text/'):
                                  response_body = await resp.text(encoding='utf-8', errors='replace')
-                        elif resp_content_type.startswith('text/'):
-                             response_body = await resp.text(encoding='utf-8', errors='replace')
-                        else:
-                             # Read non-text types as bytes, store placeholder
-                             raw_bytes = await resp.read()
-                             limit = 100
-                             if len(raw_bytes) > limit: response_body = f"[Body Binary Data - Type: {resp_content_type}, Size: {len(raw_bytes)} bytes, Starts: {raw_bytes[:limit]!r}...]"
-                             else: response_body = f"[Body Binary Data - Type: {resp_content_type}, Size: {len(raw_bytes)} bytes, Data: {raw_bytes!r}]"
-                             logger.debug(f"Step {step_identifier}: Read {len(raw_bytes)} bytes for Content-Type: {resp_content_type}")
+                            else:
+                                 # Read non-text types as bytes, store placeholder
+                                 raw_bytes = await resp.read()
+                                 limit = 100
+                                 if len(raw_bytes) > limit: response_body = f"[Body Binary Data - Type: {resp_content_type}, Size: {len(raw_bytes)} bytes, Starts: {raw_bytes[:limit]!r}...]"
+                                 else: response_body = f"[Body Binary Data - Type: {resp_content_type}, Size: {len(raw_bytes)} bytes, Data: {raw_bytes!r}]"
+                                 logger.debug(f"Step {step_identifier}: Read {len(raw_bytes)} bytes for Content-Type: {resp_content_type}")
 
-                    except aiohttp.ClientPayloadError as payload_err:
-                        logger.error(f"Step {step_identifier}: Payload error reading response body ({resp.status}): {payload_err}")
-                        response_body = f"Error reading response body: {payload_err}"
-                    except Exception as body_err:
-                        logger.error(f"Step {step_identifier}: Generic error reading response body ({resp.status}): {body_err}", exc_info=self.config.debug)
-                        response_body = f"Generic error reading response body: {body_err}"
+                        except aiohttp.ClientPayloadError as payload_err:
+                            logger.error(f"Step {step_identifier}: Payload error reading response body ({resp.status}): {payload_err}")
+                            response_body = f"Error reading response body: {payload_err}"
+                        except Exception as body_err:
+                            logger.error(f"Step {step_identifier}: Generic error reading response body ({resp.status}): {body_err}", exc_info=self.config.debug)
+                            response_body = f"Generic error reading response body: {body_err}"
 
 
-                    # --- Log Response ---
-                    log_level = logging.WARNING if response_status >= 400 else logging.INFO
-                    logger.log(log_level, f"Step {step_identifier} received: {response_status} {method} {final_url} ({request_duration_s*1000:.2f} ms)")
+                        # --- Log Response ---
+                        log_level = logging.WARNING if response_status >= 400 else logging.INFO
+                        logger.log(log_level, f"Step {step_identifier} received: {response_status} {method} {final_url} ({request_duration_s*1000:.2f} ms)")
 
-                    if logger.isEnabledFor(logging.DEBUG):
-                        log_body_repr = repr(response_body)
-                        log_body_display = f"{log_body_repr[:250]}{'...' if len(log_body_repr) > 250 else ''}"
-                        log_resp_headers = {k: ('********' if k.lower() == 'set-cookie' and v else v) for k, v in response_headers_dict.items()}
-                        logger.debug(f"  Response Headers: {log_resp_headers}")
-                        logger.debug(f"  Response Body ({type(response_body).__name__}): {log_body_display}")
+                        if logger.isEnabledFor(logging.DEBUG):
+                            log_body_repr = repr(response_body)
+                            log_body_display = f"{log_body_repr[:250]}{'...' if len(log_body_repr) > 250 else ''}"
+                            log_resp_headers = {k: ('********' if k.lower() == 'set-cookie' and v else v) for k, v in response_headers_dict.items()}
+                            logger.debug(f"  Response Headers: {log_resp_headers}")
+                            logger.debug(f"  Response Body ({type(response_body).__name__}): {log_body_display}")
 
-                    # --- Retry Logic (Retry on 5xx server errors) ---
-                    if response_status >= 500 and attempt < max_retries - 1:
-                        retry_delay = base_retry_delay * (2 ** attempt) # Exponential backoff
-                        logger.warning(f"Step {step_identifier}: Server error {response_status} on attempt {attempt+1}/{max_retries}. Retrying in {retry_delay:.2f}s...")
-                        await asyncio.sleep(retry_delay)
-                        request_succeeded = False # Reset success flag for retry
-                        continue # Go to next attempt
+                        # --- Retry Logic (Retry on 5xx server errors) ---
+                        if response_status >= 500 and attempt < max_retries - 1:
+                            retry_delay = base_retry_delay * (2 ** attempt) # Exponential backoff
+                            logger.warning(f"Step {step_identifier}: Server error {response_status} on attempt {attempt+1}/{max_retries}. Retrying in {retry_delay:.2f}s...")
+                            await asyncio.sleep(retry_delay)
+                            request_succeeded = False # Reset success flag for retry
+                            continue # Go to next attempt
 
-                    # If not retrying (success, 4xx, or 5xx on last attempt), break the loop
-                    break
+                        # If not retrying (success, 4xx, or 5xx on last attempt), break the loop
+                        break
 
-            # --- Handle Connection/Timeout Errors ---
-            except (aiohttp.ClientConnectionError, aiohttp.ClientConnectorError, asyncio.TimeoutError) as conn_err:
-                 request_duration_s = time.monotonic() - request_start_time
-                 logger.warning(f"Step {step_identifier}: Attempt {attempt+1}/{max_retries} failed: {type(conn_err).__name__}: {conn_err} ({request_duration_s*1000:.2f} ms)")
-                 if attempt < max_retries - 1:
-                     retry_delay = base_retry_delay * (2 ** attempt)
-                     logger.warning(f"Step {step_identifier}: Retrying connection after {retry_delay:.2f}s...")
-                     await asyncio.sleep(retry_delay)
-                     continue # Go to next attempt
-                 else:
-                     # Max retries reached for connection error
-                     error_message = f"Connection/Timeout Error after {max_retries} attempts: {conn_err}"
-                     logger.error(f"Step {step_identifier}: {error_message}")
-                     response_status = 598 # Custom status for connection errors
+                # --- Handle Connection/Timeout Errors ---
+                except (aiohttp.ClientConnectionError, aiohttp.ClientConnectorError, asyncio.TimeoutError) as conn_err:
+                     request_duration_s = time.monotonic() - request_start_time
+                     logger.warning(f"Step {step_identifier}: Attempt {attempt+1}/{max_retries} failed: {type(conn_err).__name__}: {conn_err} ({request_duration_s*1000:.2f} ms)")
+                     if attempt < max_retries - 1:
+                         retry_delay = base_retry_delay * (2 ** attempt)
+                         logger.warning(f"Step {step_identifier}: Retrying connection after {retry_delay:.2f}s...")
+                         await asyncio.sleep(retry_delay)
+                         continue # Go to next attempt
+                     else:
+                         # Max retries reached for connection error
+                         error_message = f"Connection/Timeout Error after {max_retries} attempts: {conn_err}"
+                         logger.error(f"Step {step_identifier}: {error_message}")
+                         response_status = 598 # Custom status for connection errors
+                         break # Exit retry loop
+
+                # --- Handle Other Client Errors ---
+                except aiohttp.ClientError as client_err:
+                     request_duration_s = time.monotonic() - request_start_time
+                     error_message = f"HTTP Client Error: {client_err}"
+                     logger.error(f"Step {step_identifier}: {error_message} ({request_duration_s*1000:.2f} ms)", exc_info=self.config.debug)
+                     response_status = 597 # Custom status for other client errors
+                     break # Exit retry loop (usually not retriable)
+
+                # --- Handle Unexpected Errors ---
+                except Exception as e:
+                     request_duration_s = time.monotonic() - request_start_time
+                     error_message = f"Unexpected error during request execution: {e}"
+                     logger.error(f"Step {step_identifier}: {error_message} ({request_duration_s*1000:.2f} ms)", exc_info=self.config.debug)
+                     response_status = 596 # Custom code for unexpected errors
                      break # Exit retry loop
 
-            # --- Handle Other Client Errors ---
-            except aiohttp.ClientError as client_err:
-                 request_duration_s = time.monotonic() - request_start_time
-                 error_message = f"HTTP Client Error: {client_err}"
-                 logger.error(f"Step {step_identifier}: {error_message} ({request_duration_s*1000:.2f} ms)", exc_info=self.config.debug)
-                 response_status = 597 # Custom status for other client errors
-                 break # Exit retry loop (usually not retriable)
+            # --- ADDITIVE: user-retry decision (step.retries) ---
+            # A pass "failed" if the request never completed (network/timeout/
+            # unexpected) OR it completed with a non-2xx status. Retry only while
+            # user attempts remain AND the user has not requested a stop.
+            pass_failed = (not request_succeeded) or (response_status < 200) or (response_status >= 300)
+            if pass_failed and user_attempts_remaining > 0 and getattr(self, 'running', True):
+                logger.warning(
+                    f"Step {step_identifier}: retry policy re-attempting after "
+                    f"{'status ' + str(response_status) if request_succeeded else (error_message or 'network error')} "
+                    f"(retry {user_attempt + 1}/{user_retry_count})."
+                )
+                if user_retry_delay_s > 0:
+                    await asyncio.sleep(user_retry_delay_s)
+                # Bail out if a stop landed during the delay — never retry past a stop.
+                if not getattr(self, 'running', True):
+                    break
+                continue  # next user pass (fresh request issued at loop top)
 
-            # --- Handle Unexpected Errors ---
-            except Exception as e:
-                 request_duration_s = time.monotonic() - request_start_time
-                 error_message = f"Unexpected error during request execution: {e}"
-                 logger.error(f"Step {step_identifier}: {error_message} ({request_duration_s*1000:.2f} ms)", exc_info=self.config.debug)
-                 response_status = 596 # Custom code for unexpected errors
-                 break # Exit retry loop
+            # Success, no retries left, or user-stop: stop re-attempting.
+            break
 
 
         # --- Post-Request Processing ---
@@ -2700,6 +2971,16 @@ class FlowRunner:
              logger.debug(f"Step {step_identifier}: Skipping extraction due to onFailure=stop.")
         elif not request_succeeded:
              logger.debug(f"Step {step_identifier}: Skipping extraction due to request execution failure.")
+
+
+        # --- ADDITIVE: declarative assertions (step.assertions) ---
+        # Evaluate against the response/extracted context once the request has
+        # completed. This is diagnostic and runs regardless of onFailure (so a
+        # stop-on-failure step still records what its assertions saw). It never
+        # raises and never changes the flow-control outcome — it only records
+        # pass/fail into the context. Skipped when the request never completed.
+        if request_succeeded:
+             self._evaluate_assertions(step.id, step_identifier, getattr(step, 'assertions', None), context)
 
 
         # Increment metrics only if the request was actually sent and received a response status
