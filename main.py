@@ -22,6 +22,7 @@ from flow_runner import (
     StartRequest,
     FLOWRUNNER_VERSION,
 )
+import sr3_report
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -254,6 +255,23 @@ def _handle_sigint(signum: int, frame: Any) -> None:
 
 
 # ---------------------------------------------------------------------------
+# SR3: write /report/report.json from the last runner's metrics
+# ---------------------------------------------------------------------------
+def _write_sr3_report() -> None:
+    """Emit the SR3 report from the current metrics. Best-effort, never raises.
+
+    ``_runner_metrics`` holds the flow runner's lifetime pass/fail + status-code
+    tallies for the run window (a config reload replaces it with a fresh Metrics,
+    so this reflects the most recent window). ShowRunner pulls the sealed file at
+    window close; a missing/failed write simply degrades to Tier-0.
+    """
+    try:
+        sr3_report.write_report(_runner_metrics)
+    except Exception as exc:  # defensive — must never block shutdown
+        logger.debug("SR3 report write failed: %s", exc)
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main() -> None:
@@ -279,31 +297,39 @@ def main() -> None:
             logger.info("Shutting down without ever receiving config")
             return
 
-    # ── Start the FlowRunner ──
+    # ── Run the FlowRunner, always sealing an SR3 report on exit ──
+    # The finally covers every exit path — normal completion, run-once, a
+    # SIGTERM/SIGINT stop, or a start/runtime error — so ShowRunner can pull a
+    # sealed report whenever the container is stopped.
     try:
+        # ── Start the FlowRunner ──
         _start_runner(cfg)
+
+        # ── Start metrics bridge ──
+        metrics_thread = threading.Thread(
+            target=_metrics_push_loop, daemon=True, name="metrics-push",
+        )
+        metrics_thread.start()
+
+        # ── Block until shutdown ──
+        logger.info("FlowRunner is running. Waiting for shutdown signal...")
+        _shutdown_event.wait()
+
+        logger.info("Shutting down...")
+        _stop_runner()
+
+        if _run_once_completed:
+            logger.info("Run-once execution complete — exiting")
+        else:
+            logger.info("FlowRunner stopped")
     except Exception as exc:
-        logger.error("Failed to start FlowRunner: %s", exc)
+        logger.error("Failed to start/run FlowRunner: %s", exc)
         health.set_status("error", reason=str(exc))
         sys.exit(1)
-
-    # ── Start metrics bridge ──
-    metrics_thread = threading.Thread(
-        target=_metrics_push_loop, daemon=True, name="metrics-push",
-    )
-    metrics_thread.start()
-
-    # ── Block until shutdown ──
-    logger.info("FlowRunner is running. Waiting for shutdown signal...")
-    _shutdown_event.wait()
-
-    logger.info("Shutting down...")
-    _stop_runner()
-
-    if _run_once_completed:
-        logger.info("Run-once execution complete — exiting")
-    else:
-        logger.info("FlowRunner stopped")
+    finally:
+        # Always seal a report — the finally runs on normal exit, on the
+        # sys.exit(1) above (SystemExit still triggers finally), and on stop.
+        _write_sr3_report()
 
 
 if __name__ == "__main__":

@@ -317,6 +317,15 @@ class Metrics:
         self.flow_duration_sum = 0.0
         self.flow_count = 0
 
+        # --- SR3 outcome metrics (pass/fail + per-status-code tallies) ---
+        # These are lifetime counters for the current run window; the SR3 report
+        # writer reads them at shutdown to build /report/report.json. Unlike the
+        # rolling RPS/flow-duration metrics above they are never soft-reset, so
+        # the report reflects the whole window.
+        self.flows_passed = 0
+        self.flows_failed = 0
+        self.status_code_counts: Dict[int, int] = {}
+
     async def increment(self):
         """Record that a request was made and refresh cached RPS."""
         now = time.monotonic()
@@ -383,6 +392,31 @@ class Metrics:
             # Ensure division by zero is not possible (already checked flow_count)
             average_duration_s = self.flow_duration_sum / self.flow_count
             return average_duration_s * 1000.0
+
+    async def record_flow_result(self, passed: bool) -> None:
+        """Record the terminal pass/fail outcome of one completed flow instance.
+
+        A flow "passes" when it runs all of its steps with no ``flow_error`` set;
+        it "fails" when a step errored internally or an assertion / onFailure=stop
+        tripped. Flows interrupted by shutdown/cancellation are NOT recorded here
+        (the caller only invokes this while ``self.running`` is True), so a stop
+        never inflates the failure count. These lifetime tallies feed the SR3
+        report; they are intentionally not soft-reset.
+        """
+        async with self.lock:
+            if passed:
+                self.flows_passed += 1
+            else:
+                self.flows_failed += 1
+
+    async def record_status_code(self, status_code: int) -> None:
+        """Tally one HTTP response status code (or synthetic 59x error code)."""
+        if not isinstance(status_code, int):
+            return
+        async with self.lock:
+            self.status_code_counts[status_code] = (
+                self.status_code_counts.get(status_code, 0) + 1
+            )
 
 # ---------------------------
 # Context Helper Functions
@@ -2665,6 +2699,15 @@ class FlowRunner:
         set_value_in_context(context, f'{context_prefix}_headers', response_headers_dict)
         set_value_in_context(context, f'{context_prefix}_body', response_body)
 
+        # SR3: tally the outcome of every request that reached this point (real
+        # HTTP responses plus synthetic connection/timeout codes 596/597/598) so
+        # the report's steps.by_code measure reflects what the target returned.
+        if self.metrics is not None and isinstance(response_status, int) and response_status > 0:
+            try:
+                await self.metrics.record_status_code(response_status)
+            except Exception:
+                pass
+
         # Set or clear the error message in context
         error_key_path = f'{context_prefix}_error'
         if error_message:
@@ -3155,8 +3198,14 @@ class FlowRunner:
                         flow_duration = flow_instance_end_time - flow_instance_start_time
                         if flow_completed_successfully and self.running:
                             await self.metrics.record_flow_duration(flow_duration)
+                            await self.metrics.record_flow_result(True)
                             logger.info(f"{user_log_prefix} (Flow {flow_iteration}): Flow finished successfully in {flow_duration:.3f} seconds.")
-                        elif not self.running:
+                        elif self.running:
+                            # Flow ran to completion but ended with a flow_error — a
+                            # genuine failure (not a shutdown). Count it for SR3.
+                            await self.metrics.record_flow_result(False)
+                            logger.info(f"{user_log_prefix} (Flow {flow_iteration}): Flow finished with failure in {flow_duration:.3f} seconds.")
+                        else:
                             logger.info(f"{user_log_prefix} (Flow {flow_iteration}): Flow ended after {flow_duration:.3f} seconds (stopped/cancelled).")
 
                         if self.running:

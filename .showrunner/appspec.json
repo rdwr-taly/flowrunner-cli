@@ -113,9 +113,9 @@
   },
   "deploymentContext": "app",
   "description": "Execute multi-step API flows using ShowRunner SDK. Supports continuous, scheduled, and recurring execution modes.",
-  "displayName": "FlowRunner",
+  "displayName": "FlowRunner (SR3)",
   "icon": "fas fa-project-diagram",
-  "id": "flowrunner-cli",
+  "id": "flowrunner-cli-sr3",
   "image_id_ref": "razor29/flowrunner-cli",
   "lifecycleOptions": [
     {
@@ -231,5 +231,112 @@
       }
     ]
   },
-  "schema_version": 6
+  "sdk": {
+    "contract_version": 1,
+    "capabilities": [
+      "report_pull_file",
+      "measures"
+    ],
+    "reporting": {
+      "mode": "file",
+      "path": "/report/report.json",
+      "sealed_field": "status",
+      "sealed_value": "final",
+      "poll_interval_sec": 30
+    },
+    "measures": [
+      {
+        "key": "flows_passed",
+        "label": "Flows passed",
+        "type": "count",
+        "unit": "flows",
+        "source": {
+          "kind": "report_json",
+          "path": "flows_passed"
+        },
+        "success_checkable": true
+      },
+      {
+        "key": "flows_failed",
+        "label": "Flows failed",
+        "type": "count",
+        "unit": "flows",
+        "source": {
+          "kind": "report_json",
+          "path": "flows_failed"
+        },
+        "success_checkable": true
+      },
+      {
+        "key": "flow_success_ratio",
+        "label": "Flow success ratio",
+        "type": "ratio",
+        "unit": "fraction",
+        "higher_is_better": true,
+        "source": {
+          "kind": "report_json",
+          "path": "flow_success_ratio"
+        },
+        "success_checkable": true
+      },
+      {
+        "key": "steps.by_code",
+        "label": "Step HTTP response codes",
+        "type": "count_by_enum",
+        "unit": "requests",
+        "options": [
+          200,
+          201,
+          400,
+          401,
+          403,
+          404,
+          429,
+          500
+        ],
+        "options_open": true,
+        "source": {
+          "kind": "report_json",
+          "path": "steps.by_code"
+        },
+        "success_checkable": true
+      },
+      {
+        "key": "rps",
+        "label": "Requests/sec",
+        "type": "number",
+        "unit": "rps",
+        "source": {
+          "kind": "prometheus",
+          "metric": "flowrunner_requests_per_second"
+        },
+        "success_checkable": false
+      }
+    ],
+    "default_playbook": {
+      "steps": [
+        {
+          "id": "flows_succeeded",
+          "name": "At least 90% of flows completed successfully",
+          "check": {
+            "source": "report",
+            "field": "flow_success_ratio",
+            "op": ">=",
+            "value": 0.9
+          }
+        },
+        {
+          "id": "flows_ran",
+          "name": "At least one flow passed",
+          "check": {
+            "source": "report",
+            "field": "flows_passed",
+            "op": ">=",
+            "value": 1
+          }
+        }
+      ]
+    }
+  },
+  "schema_version": 7
 }

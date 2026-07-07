@@ -1,8 +1,8 @@
 {
-  "image": "razor29/flowrunner-cli:v2.1.0-dev",
-  "version": "v2.1.0-dev",
+  "image": "razor29/flowrunner-cli:v2.2.0-sr3",
+  "version": "v2.2.0-sr3",
   "is_latest": false,
-  "released_at": "2026-06-28T12:22:57Z",
-  "commit": "c182d39e9276590ab0af85cccd432b13482c2468",
-  "changelog": ""
+  "released_at": "2026-07-07T00:00:00Z",
+  "commit": "",
+  "changelog": "SR3 pilot: /report/report.json"
 }

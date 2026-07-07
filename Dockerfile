@@ -28,9 +28,13 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY flow_runner.py .
 COPY main.py .
+COPY sr3_report.py .
 
 # Create config mount point
 RUN mkdir -p /config
+
+# Create SR3 report mount point (/report/report.json is pulled by ShowRunner v3)
+RUN mkdir -p /report
 
 # Expose port 9090 for Prometheus metrics and health endpoint
 EXPOSE 9090
@@ -40,7 +44,7 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD curl -f http://localhost:9090/healthz || exit 1
 
 # Set ownership and switch to non-root user
-RUN chown -R ${APP_USER}:${APP_USER} /app /config
+RUN chown -R ${APP_USER}:${APP_USER} /app /config /report
 USER ${APP_USER}
 
 # App owns its own process — no CC framework wrapping
