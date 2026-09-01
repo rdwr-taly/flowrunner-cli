@@ -113,9 +113,9 @@
   },
   "deploymentContext": "app",
   "description": "Execute multi-step API flows using ShowRunner SDK. Supports continuous, scheduled, and recurring execution modes.",
-  "displayName": "FlowRunner (SR3)",
+  "displayName": "FlowRunner",
   "icon": "fas fa-project-diagram",
-  "id": "flowrunner-cli-sr3",
+  "id": "flowrunner-cli",
   "image_id_ref": "razor29/flowrunner-cli",
   "lifecycleOptions": [
     {
