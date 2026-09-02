@@ -1,8 +1,8 @@
 {
-  "image": "razor29/flowrunner-cli:v2.2.0-sr3",
-  "version": "v2.2.0-sr3",
-  "is_latest": false,
-  "released_at": "2026-07-07T09:50:40Z",
-  "commit": "9f7d8114e9400302185fe765a6bcf6763ed5519c",
+  "image": "razor29/flowrunner-cli:v3.0.0",
+  "version": "v3.0.0",
+  "is_latest": true,
+  "released_at": "2026-09-02T09:42:00Z",
+  "commit": "59f9f0513f15cef616d96d1c2cefda974f3eeaa5",
   "changelog": ""
 }
